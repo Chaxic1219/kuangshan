@@ -44,7 +44,12 @@ class LiveSelectionTests(unittest.TestCase):
         self.assertTrue(first['ok'])
         self.assertEqual([r['cameraId'] for r in first['results']], [r['cameraId'] for r in again['results']])
         self.assertEqual(len(Store(self.work).cameras), 2)
-        self.assertEqual(set(camera_source.managed_paths(self.config).values()), {'@first', '@second'})
+        mapping = camera_source.managed_paths(self.config)
+        self.assertEqual(len(mapping), 2)
+        self.assertEqual(set(mapping.values()), {'@first', '@second'})
+        config_text = self.config.read_text(encoding='utf-8')
+        self.assertIn('video="USB Camera"', config_text, '采集命令必须使用友好名')
+        self.assertNotIn('video="@device', config_text, '唯一标识不能写入 ffmpeg 命令')
         for c in self.c.store.cameras:
             self.assertEqual(len({t['model'] for t in c['tasks']}), 1)
             self.assertIn(':20000/', c['url'])
@@ -139,6 +144,9 @@ class LiveSelectionTests(unittest.TestCase):
         self.assertEqual(result['results'][0]['cameraId'], old['id'])
         self.assertEqual(len(self.c.store.cameras), 1)
         self.assertEqual(camera_source.managed_paths(self.config), {'livecam1': '@first'})
+        config_text = self.config.read_text(encoding='utf-8')
+        self.assertIn('video="USB Camera"', config_text, '采集命令必须使用友好名')
+        self.assertNotIn('video="@device', config_text, '唯一标识不能写进 ffmpeg 命令')
 
     def draft_camera(self, **overrides):
         camera = {'id': '', 'name': '本机摄像头', 'location': '东区',
@@ -160,6 +168,9 @@ class LiveSelectionTests(unittest.TestCase):
         self.assertEqual(cameras[0]['tasks'][0]['eventId'], 'fire')
         self.assertEqual(cameras[0]['cover'], '/covers/live.jpg')
         self.assertEqual(camera_source.managed_paths(self.config), {'livecam1': '@first'})
+        config_text = self.config.read_text(encoding='utf-8')
+        self.assertIn('video="USB Camera"', config_text, '采集命令必须使用友好名')
+        self.assertNotIn('video="@device', config_text, '唯一标识不能写进 ffmpeg 命令')
         streams.assert_called_once_with('start')
         probe.assert_called_once()
 
@@ -172,6 +183,9 @@ class LiveSelectionTests(unittest.TestCase):
         self.assertEqual(len(Store(self.work).cameras), 1)
         self.assertEqual(Store(self.work).cameras[0]['name'], '改名后')
         self.assertEqual(camera_source.managed_paths(self.config), {'livecam1': '@first'})
+        config_text = self.config.read_text(encoding='utf-8')
+        self.assertIn('video="USB Camera"', config_text, '采集命令必须使用友好名')
+        self.assertNotIn('video="@device', config_text, '唯一标识不能写进 ffmpeg 命令')
 
     def test_adopt_rejects_change_while_running(self):
         with patch.object(self.c, 'control_live_streams'), \

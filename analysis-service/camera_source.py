@@ -107,9 +107,13 @@ def build_push_command(device, path_name, framerate=None, size=None, bitrate='12
                        rtsp_port=8554):
     """生成 dshow 采集转码推 RTSP 的 ffmpeg 命令（单行，供 runOnInit 使用）。
 
+    device 必须是 dshow 友好名（如 "USB2.0 PC CAMERA"）；Alternative name 只用于
+    设备识别与匹配，ffmpeg 的 video= 不接受它。
     size 默认 None：不同摄像头支持的分辨率不同，写死会导致 "Could not set video options"。
     需要指定时传如 '1280x720'，并确认设备支持该格式。
     """
+    if isinstance(device, str) and device.strip().startswith('@device'):
+        raise ValueError('采集命令必须使用摄像头友好名称，不能使用设备唯一标识')
     if not isinstance(device, str) or not device.strip() or any(c in device for c in ('"', '\n', '\r', '\0')):
         raise ValueError('摄像头设备名不合法')
     if not PATH_NAME.fullmatch(path_name or ''):
@@ -158,11 +162,20 @@ def wait_live_ready(path_name, timeout=12):
     return False
 
 
-def _path_block(path_name, device, port):
-    return (f'  {path_name}:\n'
-            f'    runOnInit: >-\n'
-            f'      {build_push_command(device, path_name, rtsp_port=port)}\n'
-            f'    runOnInitRestart: yes\n')
+DEVICE_ID_COMMENT = '# live-device-id: '
+
+
+def _path_block(path_name, device_name, port, device_id=None):
+    """受管段的一条 path：注释行保存唯一标识，runOnInit 使用 dshow 友好名。"""
+    lines = [f'  {path_name}:']
+    if device_id:
+        lines.append(f'    {DEVICE_ID_COMMENT}{device_id}')
+    lines += [
+        '    runOnInit: >-',
+        f'      {build_push_command(device_name, path_name, rtsp_port=port)}',
+        '    runOnInitRestart: yes',
+    ]
+    return '\n'.join(lines) + '\n'
 
 
 def _split_region(text):
@@ -185,28 +198,50 @@ def _split_region(text):
     return text[:begin], text[begin + len(LIVE_PATH_MARK):end], text[end + len(LIVE_END_MARK):]
 
 
+def _managed_entries(text):
+    """解析受管段：{path: {'name': 友好名, 'id': 唯一标识或 None}}。"""
+    _, region, _ = _split_region(text)
+    entries = {}
+    blocks = re.split(r'(?m)^  ([a-z0-9][a-z0-9_-]{0,63}):\s*$', region)
+    for index in range(1, len(blocks) - 1, 2):
+        path_name, body = blocks[index], blocks[index + 1]
+        found = COMMAND_DEVICE.search(body)
+        if not found:
+            continue
+        id_match = re.search(r'(?m)^\s*%s(\S+)\s*$' % re.escape(DEVICE_ID_COMMENT), body)
+        entries[path_name] = {'name': found.group(1),
+                              'id': id_match.group(1) if id_match else None}
+    return entries
+
+
 def managed_paths(config_path):
-    """读取受管段内已保存的 {path 名: 设备名}，供页面展示与重复映射。"""
+    """读取受管段：有唯一标识时返回标识（同名设备可区分），否则回退友好名。"""
     config_path = Path(config_path)
     if not config_path.is_file():
         return {}
-    _, region, _ = _split_region(config_path.read_text(encoding='utf-8'))
-    result = {}
-    blocks = re.split(r'(?m)^  ([a-z0-9][a-z0-9_-]{0,63}):\s*$', region)
-    for index in range(1, len(blocks) - 1, 2):
-        name, body = blocks[index], blocks[index + 1]
-        found = COMMAND_DEVICE.search(body)
-        if found:
-            result[name] = found.group(1)
-    return result
+    entries = _managed_entries(config_path.read_text(encoding='utf-8'))
+    return {path: (entry['id'] or entry['name']) for path, entry in entries.items()}
+
+
+def _render_entries(entries, port):
+    lines = [LIVE_PATH_MARK]
+    for path_name in sorted(entries):
+        entry = entries[path_name]
+        lines.append(_path_block(path_name, entry['name'], port, entry.get('id')).rstrip('\n'))
+    lines.append(LIVE_END_MARK)
+    return '\n'.join(lines) + '\n'
 
 
 def _render_region(mapping, port):
-    lines = [LIVE_PATH_MARK]
-    for path_name in sorted(mapping):
-        lines.append(_path_block(path_name, mapping[path_name], port).rstrip('\n'))
-    lines.append(LIVE_END_MARK)
-    return '\n'.join(lines) + '\n'
+    """兼容旧调用：mapping 为 {path: 名称或 {'name','id'}}。"""
+    entries = {}
+    for path_name, value in mapping.items():
+        if isinstance(value, dict):
+            entries[path_name] = {'name': value.get('name') or value.get('device'),
+                                  'id': value.get('id')}
+        else:
+            entries[path_name] = {'name': str(value), 'id': None}
+    return _render_entries(entries, port)
 
 
 def all_path_names(config_path):
@@ -215,10 +250,12 @@ def all_path_names(config_path):
 
 
 @serialized
-def upsert_live_path(config_path, path_name, device):
-    """把设备写入受管段；返回 True 表示新增，False 表示替换已有 path。"""
-    added = path_name not in managed_paths(config_path)
-    write_live_config(config_path, {path_name: device})
+def upsert_live_path(config_path, path_name, device, device_id=None):
+    """把设备写入受管段；device 为 dshow 友好名，device_id 为可选唯一标识。"""
+    config_path = Path(config_path)
+    text = config_path.read_text(encoding='utf-8') if config_path.is_file() else ''
+    added = path_name not in _managed_entries(text)
+    write_live_config(config_path, {path_name: {'name': device, 'id': device_id}})
     return added
 
 
@@ -228,25 +265,29 @@ def write_live_config(config_path, updates):
     config_path = Path(config_path)
     text = config_path.read_text(encoding='utf-8') if config_path.is_file() else 'paths:\n'
     port = config_rtsp_port(text)
-    mapping = managed_paths(config_path)
-    manual_names = all_path_names(config_path) - mapping.keys()
-    for path_name, device in updates.items():
-        build_push_command(device, path_name)
+    entries = _managed_entries(text)
+    manual_names = all_path_names(config_path) - entries.keys()
+    for path_name, value in updates.items():
+        if isinstance(value, dict):
+            name, device_id = value.get('name'), value.get('id')
+        else:
+            name, device_id = str(value), None
+        build_push_command(name, path_name)
         if path_name in manual_names:
             raise ValueError('路径名与手写配置重复，请选择其他名称')
-        mapping[path_name] = device.strip()
+        entries[path_name] = {'name': str(name).strip(), 'id': device_id}
     head, _, tail = _split_region(text)
     # 受管段紧跟 paths: 之后；若原文件没有 paths: 则补上。
     if 'paths:' not in head:
         head = head.rstrip('\n') + '\npaths:\n'
     if tail.strip():
-        body = head.rstrip('\n') + '\n' + _render_region(mapping, port) + '\n' + tail.lstrip('\n')
+        body = head.rstrip('\n') + '\n' + _render_entries(entries, port) + '\n' + tail.lstrip('\n')
     else:
-        body = head.rstrip('\n') + '\n' + _render_region(mapping, port)
+        body = head.rstrip('\n') + '\n' + _render_entries(entries, port)
     if not body.endswith('\n'):
         body += '\n'
     atomic_text(config_path, body)
-    return mapping
+    return {path: (entry['id'] or entry['name']) for path, entry in entries.items()}
 
 
 @serialized

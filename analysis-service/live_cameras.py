@@ -136,7 +136,9 @@ def _configure(controller, selections, start, models, capacity):
             camera = validate_camera(camera)
             saved.append((camera, bool(device)))
         before = config.read_text(encoding='utf-8')
-        source.write_live_config(config, {c['livePath']: c['liveDeviceId'] for c, _ in saved})
+        source.write_live_config(config, {
+            c['livePath']: {'name': c['liveDeviceName'], 'id': c['liveDeviceId']}
+            for c, _ in saved})
         replacements = {c['id']: c for c, _ in saved}
         updated = [replacements.pop(c['id'], c) for c in controller.store.cameras] + list(replacements.values())
         try:
@@ -226,14 +228,14 @@ def adopt_single(controller, device_id, camera, start, models, capacity):
         mapping = source.managed_paths(config)
         names = source.all_path_names(config)
         port = source.config_rtsp_port(config.read_text(encoding='utf-8'))
+        name = device['name'] if device else (existing or {}).get('liveDeviceName', device_id)
         path = (existing or {}).get('livePath') or next(
-            (p for p, d in mapping.items() if d == device_id), '')
+            (p for p, d in mapping.items() if d in {device_id, name}), '')
         if not path:
             index = 1
             while 'livecam%d' % index in names:
                 index += 1
             path = 'livecam%d' % index
-        name = device['name'] if device else (existing or {}).get('liveDeviceName', device_id)
         camera_doc = {
             **(existing or {}),
             'id': editing or uuid.uuid4().hex[:12],
@@ -249,7 +251,7 @@ def adopt_single(controller, device_id, camera, start, models, capacity):
         }
         camera_doc = validate_camera(camera_doc)
         before = config.read_text(encoding='utf-8')
-        source.write_live_config(config, {path: device_id})
+        source.write_live_config(config, {path: {'name': name, 'id': device_id}})
         replacements = {camera_doc['id']: camera_doc}
         updated = [replacements.pop(c['id'], c) for c in controller.store.cameras] \
             + list(replacements.values())

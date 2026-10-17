@@ -784,22 +784,24 @@ class Controller:
             matches = [d for d in devices if d['usable'] and d['name'] == device]
         if len(matches) != 1:
             raise ValueError('该摄像头当前不可用，请刷新设备列表')
-        device = matches[0].get('id', matches[0]['name'])
+        device_id = matches[0].get('id', matches[0]['name'])
+        device_name = matches[0]['name']
         mapping = camera_source.managed_paths(camera_source.live_config_path())
         if not isinstance(path_name, str):
             raise ValueError('摄像头路径名无效')
         path_name = (path_name or '').strip()
         if not path_name:
-            path_name = next((p for p, d in mapping.items() if d == device), '')
+            path_name = next((p for p, d in mapping.items()
+                              if d in {device_id, device_name}), '')
         if not path_name:
             index = 1
             while 'livecam%d' % index in camera_source.all_path_names(camera_source.live_config_path()):
                 index += 1
             path_name = 'livecam%d' % index
         config = camera_source.ensure_live_config()
-        added = camera_source.upsert_live_path(config, path_name, device)
+        added = camera_source.upsert_live_path(config, path_name, device_name, device_id)
         port = camera_source.config_rtsp_port(config.read_text(encoding='utf-8'))
-        return {'ok': True, 'path': path_name, 'device': device.strip(),
+        return {'ok': True, 'path': path_name, 'device': device_id,
                 'url': camera_source.live_stream_url(path_name, port), 'added': added,
                 'stream': self.live_stream_status(),
                 'message': '已写入配置；启动或重启“本机摄像头流”后即可添加该地址'}
