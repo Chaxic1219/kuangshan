@@ -3,7 +3,8 @@
 ## 目录结构
 - `bin/mediamtx.exe` — 流媒体服务器（v1.21.0）
 - `bin/ffmpeg_bin/` — FFmpeg（负责把本地视频循环推成 RTSP 流）
-- `mediamtx.yml` — 核心配置：camera1~camera8 共 8 路模拟摄像头
+- `mediamtx.yml` — 完整配置（18 路）；`mediamtx-lite.yml` — 精简配置（8 路）
+- `stream_control.py` — 安全启停入口：MediaMTX 与 FFmpeg 归入项目专属作业对象
 
 ## 启动（推荐：一键脚本）
 解压到**任意位置**后，双击对应的 bat 即可，不用改任何路径。
@@ -13,20 +14,24 @@
 | `start_streams.bat` | 18 路（camera1~18） | 完整演示、答辩 |
 | `start_streams_lite.bat` | 8 路（camera1~8） | 低配电脑、只要主要点位、降低 CPU 占用 |
 
-脚本会自动完成：环境自检 → 端口检查 → 启动 MediaMTX → 拉起 FFmpeg 推流
-→ 就绪后打印本机/局域网 RTSP 地址，并自动打开浏览器预览 camera1。
+脚本内部统一调用 `stream_control.py`：环境自检 → 端口冲突检查 → 以作业对象
+启动 MediaMTX → 拉起 FFmpeg 推流 → 就绪后打印 RTSP 地址，并自动打开浏览器
+预览 camera1。启动后没有需要保持打开的控制台窗口；关闭启动窗口不会停止流服务。
 
-停止：双击 `stop_streams.bat`（会同时停掉 MediaMTX 和全部 FFmpeg）。
+停止：双击 `stop_streams.bat`。停止命令只操作本项目拥有的作业对象，不会按进程名
+或窗口标题结束其他 MediaMTX/FFmpeg；身份校验失败时拒绝强制终止。
 
 > 首次运行时若弹出 Windows 防火墙，请点"允许访问"，否则外部设备拉不到流。
-> 不想自动弹浏览器：把 bat 里的 `AUTO_OPEN` 改成 `0`（或运行前 `set AUTO_OPEN=0`）。
+> 端口被其他程序占用时会直接报冲突并拒绝启动，不会尝试释放对方端口；
+> 可用 `--config` 指定自定义端口的配置文件：
+> `启动-完整18路.bat --config D:\my-mediamtx.yml`
 
-## 启动（手动方式）
-在本目录打开终端执行：
+## 启动（手动方式，不推荐）
+直接运行 `bin\mediamtx.exe mediamtx.yml` 会绕过作业管理：停止脚本、崩溃回收和
+单实例保护都不再生效。需要排障时可临时使用，正常请走上面的 bat 或：
 ```
-bin\mediamtx.exe mediamtx.yml
+python stream_control.py start --mode full
 ```
-看到 `startup complete` 即启动成功，18 路流自动上线。
 
 ## RTSP 地址（前端直接填）
 | 点位 | 地址 |

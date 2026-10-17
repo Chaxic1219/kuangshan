@@ -1,18 +1,19 @@
 @echo off
-REM ============================================================
-REM  便捷入口：双击本文件即可启动（精简模式，8 路摄像头）
-REM  真正的脚本在 mediamtx 目录下，这里只是转发，方便不用进文件夹
-REM ============================================================
-chcp 936 >nul 2>&1
+REM Convenience entry: start simulated streams in lite mode (8 cameras).
+REM The real implementation is mediamtx\stream_control.py.
+setlocal
 cd /d "%~dp0"
-
-if not exist "mediamtx\start_streams_lite.bat" (
-    echo.
-    echo   [错误] 找不到 mediamtx\start_streams_lite.bat
-    echo   请确认本文件和 mediamtx 文件夹在同一层，且解压完整。
-    echo.
-    pause
-    exit /b 1
+set "PY=..\analysis-service\.venv\Scripts\python.exe"
+if not exist "%PY%" (
+    where python >nul 2>&1
+    if errorlevel 1 (
+        echo [ERROR] Python not found. Expected %PY% or python on PATH.
+        pause
+        exit /b 1
+    )
+    set "PY=python"
 )
-
-call "mediamtx\start_streams_lite.bat"
+"%PY%" "mediamtx\stream_control.py" start --mode lite %*
+set "CODE=%ERRORLEVEL%"
+pause
+exit /b %CODE%

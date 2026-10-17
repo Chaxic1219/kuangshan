@@ -1,6 +1,19 @@
 @echo off
-rem Start MediaMTX only (18 simulated camera streams)
-rem RTSP 8554 / WHEP 8889 / API 9997. Keep this window open.
+REM Start MediaMTX through the project-owned job (full mode).
+REM Kept for compatibility; stream_control.py owns lifecycle and cleanup.
+setlocal
 cd /d "%~dp0"
-bin\mediamtx.exe mediamtx.yml
+set "PY=..\..\analysis-service\.venv\Scripts\python.exe"
+if not exist "%PY%" (
+    where python >nul 2>&1
+    if errorlevel 1 (
+        echo [ERROR] Python not found. Expected %PY% or python on PATH.
+        pause
+        exit /b 1
+    )
+    set "PY=python"
+)
+"%PY%" "stream_control.py" start --mode full %*
+set "CODE=%ERRORLEVEL%"
 pause
+exit /b %CODE%
