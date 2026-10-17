@@ -2,7 +2,7 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import copy
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -14,7 +14,7 @@ import subprocess
 import sys
 import threading
 import time
-from urllib.parse import urlsplit, unquote
+from urllib.parse import parse_qs, urlsplit, unquote
 import uuid
 from catalog import ROOT, Store, EVENTS, model_status, validate_camera, validate_source, atomic_json, identifier, MEDIA_ROOT, resolve_source
 from alerts import public_status
@@ -481,14 +481,22 @@ class Controller:
             with closing(sqlite3.connect(self.database)) as db, db:
                 count = db.execute('SELECT COUNT(*) FROM alerts').fetchone()[0]
                 alerts = [json.loads(x[0]) for x in db.execute('SELECT record FROM alerts ORDER BY at DESC LIMIT 100')]
-            # 汇总各路上报状态，便于在界面上直接看出告警是否真的发出去了。
+            # 上报计数：本次启动的成功/失败尝试来自运行快照；pending/dead 直接读持久化队列。
             bridge = public_status()
-            detail = {'reported': 0, 'failed': 0, 'pending': 0}
+            detail = {'reported': 0, 'failed': 0, 'pending': 0, 'dead': 0}
+            queue_message = ''
             for camera in cameras:
                 info = camera.get('alerts') or {}
-                for key in detail:
+                for key in ('reported', 'failed'):
                     detail[key] += int(info.get(key) or 0)
+                if not queue_message and info.get('message'):
+                    queue_message = info['message']
+            counts = self._outbox_counts()
+            detail['pending'] = counts['pending']
+            detail['dead'] = counts['dead']
             bridge['detail'] = detail
+            if queue_message:
+                bridge['queueMessage'] = queue_message
             # 只聚合有效资源样本；无样本时返回 null，不用假零值冒充真实占用。
             used = {'rssMb': 0.0, 'cpuPercent': 0.0}
             sample_count = 0
@@ -509,6 +517,119 @@ class Controller:
                                  'cpuScope': 'process',
                                  'rssMb': round(used['rssMb'], 1) if sample_count else None,
                                  'cpuPercent': round(used['cpuPercent'], 1) if sample_count else None}}
+
+    # ==================== 待发送队列 ====================
+
+    def _outbox_counts(self):
+        """直接读取各摄像头 outbox 的 pending/dead 数量，不依赖已停止进程的快照。"""
+        totals = {'pending': 0, 'dead': 0}
+        for camera in self.store.cameras:
+            path = self.work/'outbox'/camera['id']/'outbox.db'
+            if not path.is_file():
+                continue
+            try:
+                with closing(sqlite3.connect(path, timeout=5)) as db:
+                    columns = {row[1] for row in db.execute('PRAGMA table_info(outbox)')}
+                    if 'state' not in columns:
+                        totals['pending'] += int(db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0])
+                        continue
+                    for state, count in db.execute('SELECT state, COUNT(*) FROM outbox GROUP BY state'):
+                        if state in totals:
+                            totals[state] += int(count)
+            except sqlite3.Error:
+                continue
+        return totals
+
+    def outbox_rows(self, camera_id='', state='dead', limit=50, offset=0):
+        limit = max(1, min(int(limit), 100))
+        offset = max(0, int(offset))
+        cameras = [c for c in self.store.cameras if not camera_id or c['id'] == camera_id]
+        rows = []
+        for camera in cameras:
+            rows.extend(self._camera_outbox_rows(camera['id'], state))
+        rows.sort(key=lambda item: item['updatedAt'] or '', reverse=True)
+        return rows[offset:offset + limit]
+
+    def _camera_outbox_rows(self, camera_id, state):
+        path = self.work/'outbox'/camera_id/'outbox.db'
+        if not path.is_file():
+            return []
+        rows = []
+        try:
+            with closing(sqlite3.connect(path, timeout=5)) as db:
+                columns = {row[1] for row in db.execute('PRAGMA table_info(outbox)')}
+                if 'state' not in columns:
+                    if state != 'pending':
+                        return []
+                    for outbox_id, payload, attempts in db.execute(
+                            'SELECT id, payload, attempts FROM outbox').fetchall():
+                        rows.append(self._outbox_row(camera_id, outbox_id, payload, attempts,
+                                                     'pending', '', 0))
+                    return rows
+                for outbox_id, payload, attempts, row_state, last_error, updated_at in db.execute(
+                        'SELECT id, payload, attempts, state, last_error, updated_at '
+                        'FROM outbox WHERE state=?', (state,)).fetchall():
+                    rows.append(self._outbox_row(camera_id, outbox_id, payload, attempts,
+                                                 row_state, last_error, updated_at))
+        except sqlite3.Error:
+            return []
+        return rows
+
+    @staticmethod
+    def _outbox_row(camera_id, outbox_id, payload, attempts, state, last_error, updated_at):
+        event_name = '未知事件'
+        try:
+            data = json.loads(payload)
+            record = data.get('record') or {}
+            event_name = record.get('eventName') or record.get('eventId') or event_name
+        except (TypeError, ValueError):
+            pass
+        error = (last_error or '').strip()
+        if len(error) > 200:
+            error = error[:200]
+        stamp = ''
+        if updated_at:
+            try:
+                stamp = datetime.fromtimestamp(float(updated_at), timezone.utc).isoformat()
+            except (TypeError, ValueError, OSError):
+                stamp = ''
+        return {'cameraId': camera_id, 'id': outbox_id, 'eventName': event_name,
+                'state': state, 'attempts': int(attempts), 'error': error,
+                'updatedAt': stamp}
+
+    def retry_outbox(self, camera_id, outbox_id):
+        """把指定 dead 记录改回 pending；未运行摄像头只排队，不虚报已发送。"""
+        if not identifier(camera_id) or not isinstance(outbox_id, str) or not re.fullmatch(
+                r'[A-Za-z0-9._:-]{1,128}', outbox_id):
+            raise ValueError('队列记录编号无效')
+        if not any(c['id'] == camera_id for c in self.store.cameras):
+            raise ValueError('视频不存在')
+        path = self.work/'outbox'/camera_id/'outbox.db'
+        running = self.running(camera_id)
+        if not path.is_file():
+            return {'ok': False, 'retried': 0, 'running': running,
+                    'message': '该视频没有待发送队列'}
+        try:
+            with closing(sqlite3.connect(path, timeout=5)) as db:
+                columns = {row[1] for row in db.execute('PRAGMA table_info(outbox)')}
+            if 'state' not in columns:
+                return {'ok': False, 'retried': 0, 'running': running,
+                        'message': '队列尚未升级，请先启动一次分析服务完成迁移'}
+            with closing(sqlite3.connect(path, timeout=5)) as db, db:
+                cursor = db.execute(
+                    "UPDATE outbox SET state='pending', attempts=0, next_at=0, "
+                    "last_error='', updated_at=? WHERE id=? AND state='dead'",
+                    (time.time(), outbox_id))
+                changed = int(cursor.rowcount)
+        except sqlite3.Error:
+            raise ValueError('队列数据库暂时不可用') from None
+        if not changed:
+            message = '记录不存在或不是待处理状态'
+        elif running:
+            message = '已重新排队，将尽快发送'
+        else:
+            message = '已重新排队，下次启动分析后发送'
+        return {'ok': changed > 0, 'retried': changed, 'running': running, 'message': message}
 
     def alerts_csv(self):
         """把事件记录导出为 CSV 文本（字段与页面事件表一致）。"""
@@ -659,6 +780,23 @@ def make_handler(controller, token):
                 return self.reply(200, {**data, 'token': token})
             if route == '/api/samples':
                 return self.reply(200, controller.samples())
+            if route == '/api/alerts/outbox':
+                params = parse_qs(urlsplit(self.path).query)
+                camera_id = (params.get('cameraId') or [''])[0].strip()
+                state = (params.get('state') or ['dead'])[0].strip()
+                if state not in ('pending', 'dead'):
+                    return self.reply(400, {'error': '队列状态参数无效'})
+                if camera_id and not identifier(camera_id):
+                    return self.reply(400, {'error': '视频编号无效'})
+                try:
+                    limit = int((params.get('limit') or ['50'])[0])
+                    offset = int((params.get('offset') or ['0'])[0])
+                except ValueError:
+                    return self.reply(400, {'error': '分页参数无效'})
+                with controller.lock:
+                    rows = controller.outbox_rows(camera_id, state, limit, offset)
+                return self.reply(200, {'rows': rows, 'limit': max(1, min(limit, 100)),
+                                        'offset': max(0, offset)})
             if route == '/api/alerts/export.csv':
                 # 事件记录导出：带 BOM，保证 Excel 直接打开中文不乱码。
                 body = '\ufeff' + controller.alerts_csv()
@@ -706,6 +844,8 @@ def make_handler(controller, token):
                     raise ValueError('请求格式错误')
                 if self.path == '/api/cameras/probe':
                     return self.reply(200, controller.probe(data.get('url')))
+                if self.path == '/api/alerts/retry':
+                    return self.reply(200, controller.retry_outbox(data.get('cameraId'), data.get('id')))
                 with controller.lock:
                     if self.path == '/api/cameras/save':
                         return self.reply(200, {'camera': controller.save(data)})

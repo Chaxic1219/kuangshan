@@ -1,15 +1,19 @@
-"""告警上报桥：幂等编号、重试退避、队列上限与重启恢复。"""
+"""告警上报桥：幂等编号、重试退避、dead 状态、人工重试、冷却迁移与数据库迁移。"""
 import json
 import os
 import sqlite3
 import tempfile
 import time
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stderr
+from io import StringIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+from urllib.error import HTTPError, URLError
 
 import alerts
+
+REAL_SETTINGS = alerts.settings
 
 
 def record(camera='A', captured='2026-10-13T00:00:00+00:00', detections=1):
@@ -23,12 +27,12 @@ def record(camera='A', captured='2026-10-13T00:00:00+00:00', detections=1):
 
 def settings_stub(root):
     return {
-        'enabled': True, 'url': 'http://127.0.0.1:59999/api/alerts', 'cooldown': 0,
+        'enabled': True, 'url': 'http://127.0.0.1:59999/api/alerts',
         'timeout': 1, 'uploadRoot': str(root / 'uploads'), 'uploadPrefix': '/uploads'}
 
 
 class FailingOpener:
-    """模拟上报接口不可用，并统计调用次数。"""
+    """模拟接口不可用，并统计调用次数。"""
 
     def __init__(self, fail_times=10 ** 9):
         self.calls = 0
@@ -52,6 +56,18 @@ class FailingOpener:
         return Response()
 
 
+class HttpStatusOpener:
+    """按指定状态码失败；healthy=True 时成功。"""
+
+    def __init__(self, code):
+        self.code = code
+        self.calls = 0
+
+    def __call__(self, request, timeout=None):
+        self.calls += 1
+        raise HTTPError('http://127.0.0.1:59999/api/alerts', self.code, 'error', {}, None)
+
+
 class AlertBridgeTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -65,10 +81,33 @@ class AlertBridgeTests(unittest.TestCase):
         self.patcher.stop()
         self.tmp.cleanup()
 
+    def reporter(self, opener, max_pending=1000, outbox=None):
+        reporter = alerts.AlertReporter(
+            {'id': 'A', 'cameraName': 't'}, self.root, opener=opener,
+            outbox_path=outbox or self.root / 'a.db', max_pending=max_pending)
+        self.addCleanup(reporter.close)
+        return reporter
+
+    def wait_for(self, predicate, timeout=8):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not predicate():
+            time.sleep(0.1)
+        return predicate()
+
+    def wait_counts(self, reporter, pending=None, dead=None, timeout=8):
+        def matches():
+            counts = reporter.counts()
+            return ((pending is None or counts['pending'] == pending) and
+                    (dead is None or counts['dead'] == dead))
+        return self.wait_for(matches, timeout)
+
+    def rows(self, reporter):
+        with closing(sqlite3.connect(reporter.database)) as db:
+            return db.execute('SELECT id, state, last_error, attempts FROM outbox ORDER BY id').fetchall()
+
     # ---------- 幂等编号 ----------
 
     def test_alert_code_stable_across_runs(self):
-        """同一告警在不同运行（frameId 不同）下必须得到同一编号。"""
         first = alerts.AlertReporter.alert_code(record())
         second = alerts.AlertReporter.alert_code({**record(), 'frameId': 'another-run-A-99'})
         self.assertEqual(first, second)
@@ -80,150 +119,216 @@ class AlertBridgeTests(unittest.TestCase):
         self.assertNotEqual(base, other)
 
     def test_alert_code_differs_per_detection_in_same_frame(self):
-        """同一帧内的多个目标必须各自得到不同编号，否则 Java 侧只会入库一条。"""
         rec = record()
         first = alerts.AlertReporter.alert_code(rec, {'label': 'NO-Hardhat', 'trackId': 1}, 0)
         second = alerts.AlertReporter.alert_code(rec, {'label': 'NO-Hardhat', 'trackId': 2}, 1)
         self.assertNotEqual(first, second)
-        # 同一目标重试时必须稳定
         self.assertEqual(first, alerts.AlertReporter.alert_code(rec, {'label': 'NO-Hardhat', 'trackId': 1}, 0))
 
-    def test_multiple_detections_all_queued_with_unique_codes(self):
-        """一帧多个目标应产生多条待发送记录，且编号互不相同。"""
-        opener = FailingOpener()
-        reporter = alerts.AlertReporter({'id': 'A', 'cameraName': 't'}, self.root,
-                                        opener=opener, outbox_path=self.root / 'a.db')
-        try:
-            reporter.submit(record(detections=3), self.snapshot)
-            with closing(sqlite3.connect(self.root / 'a.db')) as db:
-                codes = [r[0] for r in db.execute('SELECT alert_code FROM outbox')]
-            self.assertEqual(len(codes), 3)
-            self.assertEqual(len(set(codes)), 3, '每条检测应有独立编号')
-        finally:
-            reporter.close()
+    # ---------- 入队与事务 ----------
 
-    # ---------- 队列上限 ----------
+    def test_multiple_detections_all_queued_with_unique_codes(self):
+        reporter = self.reporter(FailingOpener())
+        result = reporter.submit(record(detections=3), self.snapshot)
+        self.assertEqual(result['queued'], 3)
+        self.assertEqual(reporter.counts()['pending'], 3)
+        with closing(sqlite3.connect(reporter.database)) as db:
+            codes = [row[0] for row in db.execute('SELECT alert_code FROM outbox')]
+        self.assertEqual(len(set(codes)), 3)
+
+    def test_two_events_same_type_both_queued(self):
+        """业务层已接受的两条事件都必须入队（桥接层不再按事件类型冷却）。"""
+        reporter = self.reporter(FailingOpener())
+        first = {**record(captured='2026-10-13T00:00:00+00:00'), 'id': 'evt-1',
+                 'detections': [{'label': 'NO-Hardhat', 'confidence': .9, 'trackId': 1}]}
+        second = {**record(captured='2026-10-13T00:00:05+00:00'), 'id': 'evt-2',
+                  'detections': [{'label': 'NO-Hardhat', 'confidence': .9, 'trackId': 2}]}
+        reporter.submit(first, self.snapshot)
+        reporter.submit(second, self.snapshot)
+        self.assertEqual(reporter.counts()['pending'], 2)
 
     def test_rejects_when_pending_limit_reached(self):
-        opener = FailingOpener()
-        reporter = alerts.AlertReporter({'id': 'A', 'cameraName': 't'}, self.root,
-                                        opener=opener, outbox_path=self.root / 'a.db',
-                                        max_pending=2)
-        try:
-            for i in range(5):
-                reporter.submit({**record(), 'id': f'evt-{i}',
-                                 'capturedAt': f'2026-10-13T00:00:0{i}+00:00'}, self.snapshot)
-            self.assertLessEqual(reporter.pending(), 2)
-            self.assertEqual(reporter.status()['state'], 'degraded')
-        finally:
-            reporter.close()
-
-    # ---------- 重启恢复 ----------
-
-    def test_pending_survives_restart_and_is_delivered(self):
-        """接口不可用时记录留在 outbox；重建 reporter（模拟重启）后应补发。"""
-        outbox = self.root / 'a.db'
-        opener = FailingOpener()
-        first = alerts.AlertReporter({'id': 'A', 'cameraName': 't'}, self.root,
-                                     opener=opener, outbox_path=outbox)
-        try:
-            first.submit(record(), self.snapshot)
-            time.sleep(1.2)
-            self.assertGreaterEqual(first.pending(), 1)
-        finally:
-            first.close()
-
-        # 重启：新的上报器复用同一 outbox，接口此时可用。
-        healthy = FailingOpener(fail_times=0)
-        second = alerts.AlertReporter({'id': 'A', 'cameraName': 't'}, self.root,
-                                      opener=healthy, outbox_path=outbox)
-        try:
-            deadline = time.monotonic() + 8
-            while time.monotonic() < deadline and second.pending():
-                time.sleep(.2)
-            self.assertEqual(second.pending(), 0, '重启后应补发完待发送记录')
-            self.assertGreaterEqual(healthy.calls, 1)
-            self.assertEqual(second.reported, 1)
-        finally:
-            second.close()
-
-    # ---------- 重试退避 ----------
-
-    def test_retries_then_succeeds(self):
-        opener = FailingOpener(fail_times=1)
-        reporter = alerts.AlertReporter({'id': 'A', 'cameraName': 't'}, self.root,
-                                        opener=opener, outbox_path=self.root / 'a.db')
-        try:
-            reporter.submit(record(), self.snapshot)
-            deadline = time.monotonic() + 8
-            while time.monotonic() < deadline and reporter.pending():
-                time.sleep(.2)
-            self.assertEqual(reporter.pending(), 0)
-            self.assertGreaterEqual(opener.calls, 2, '首次失败后应重试')
-            self.assertEqual(reporter.reported, 1)
-        finally:
-            reporter.close()
-
-    # ---------- 无检测不产生告警 ----------
+        reporter = self.reporter(FailingOpener(), max_pending=2)
+        reporter.submit(record(captured='2026-10-13T00:00:00+00:00', detections=2), self.snapshot)
+        result = reporter.submit(record(captured='2026-10-13T00:00:05+00:00', detections=2), self.snapshot)
+        self.assertIn('error', result)
+        self.assertEqual(result['queued'], 0)
+        self.assertLessEqual(reporter.counts()['pending'], 2)
+        self.assertEqual(reporter.status()['state'], 'degraded')
 
     def test_no_detections_is_not_queued(self):
-        opener = FailingOpener()
-        reporter = alerts.AlertReporter({'id': 'A', 'cameraName': 't'}, self.root,
-                                        opener=opener, outbox_path=self.root / 'a.db')
-        try:
-            reporter.submit({**record(), 'detections': []}, self.snapshot)
-            time.sleep(.3)
-            self.assertEqual(reporter.pending(), 0)
-        finally:
-            reporter.close()
+        reporter = self.reporter(FailingOpener())
+        result = reporter.submit({**record(), 'detections': []}, self.snapshot)
+        self.assertEqual(result['queued'], 0)
+        time.sleep(.3)
+        self.assertEqual(reporter.counts()['pending'], 0)
 
-    # ---------- 未配置时为禁用 ----------
+    # ---------- dead 状态 ----------
+
+    def test_missing_snapshot_marks_dead_and_keeps_record(self):
+        reporter = self.reporter(FailingOpener())
+        result = reporter.submit(record(), self.root / 'missing.jpg')
+        self.assertIn('error', result)
+        self.assertTrue(self.wait_counts(reporter, pending=0, dead=1))
+        rows = self.rows(reporter)
+        self.assertEqual(rows[0][1], 'dead')
+        self.assertIn('证据截图', rows[0][2])
+
+    def test_bad_payload_marks_dead_without_killing_worker(self):
+        reporter = self.reporter(FailingOpener())
+        with closing(sqlite3.connect(reporter.database)) as db, db:
+            db.execute(
+                "INSERT INTO outbox (id, alert_code, payload, snapshot, attempts, next_at, state) "
+                "VALUES (?,?,?,?,0,0,'pending')",
+                ('bad-0', 'CODE', '{not json', str(self.snapshot)))
+        self.assertTrue(self.wait_counts(reporter, pending=0, dead=1))
+        rows = self.rows(reporter)
+        self.assertIn('负载', rows[0][2])
+        self.assertTrue(reporter.worker.is_alive(), '坏记录不得使发送线程退出')
+
+    def test_http_400_marks_dead_and_is_not_retried(self):
+        opener = HttpStatusOpener(400)
+        reporter = self.reporter(opener)
+        reporter.submit(record(), self.snapshot)
+        self.assertTrue(self.wait_counts(reporter, pending=0, dead=1))
+        self.assertEqual(opener.calls, 1)
+        time.sleep(1.2)
+        self.assertEqual(opener.calls, 1, 'dead 记录不得自动重试')
+        self.assertIsNone(reporter._claim())
+
+    def test_http_401_marks_dead(self):
+        opener = HttpStatusOpener(401)
+        reporter = self.reporter(opener)
+        reporter.submit(record(), self.snapshot)
+        self.assertTrue(self.wait_counts(reporter, pending=0, dead=1))
+
+    def test_http_429_and_500_keep_pending(self):
+        for code in (429, 500):
+            with self.subTest(code=code):
+                opener = HttpStatusOpener(code)
+                reporter = self.reporter(opener)
+                reporter.submit(record(captured='2026-10-13T00:00:0%d+00:00' % (code % 10)), self.snapshot)
+                self.assertTrue(self.wait_for(lambda: opener.calls >= 1))
+                self.assertEqual(reporter.counts()['dead'], 0)
+                self.assertEqual(reporter.counts()['pending'], 1)
+                reporter.close()
+
+    # ---------- 人工重试 ----------
+
+    def test_manual_retry_requeues_only_dead(self):
+        dead_opener = HttpStatusOpener(400)
+        reporter = self.reporter(dead_opener)
+        reporter.submit({**record(captured='2026-10-13T00:00:00+00:00'), 'id': 'evt-1'}, self.snapshot)
+        reporter.submit({**record(captured='2026-10-13T00:00:05+00:00'), 'id': 'evt-2'}, self.snapshot)
+        self.assertTrue(self.wait_counts(reporter, pending=0, dead=2))
+        # 停止发送线程后验证重试只改数据库状态（实际发送由下次启动负责）。
+        reporter.close()
+        ids = [row[0] for row in self.rows(reporter)]
+        self.assertEqual(reporter.retry(ids[0]), 1)
+        self.assertEqual(reporter.counts()['pending'], 1)
+        self.assertEqual(reporter.counts()['dead'], 1)
+        self.assertEqual(reporter.retry(ids[0]), 0, '重复重试不重复入队')
+        self.assertEqual(reporter.retry('missing-id'), 0)
+
+    def test_retry_unknown_id_returns_zero(self):
+        reporter = self.reporter(FailingOpener())
+        self.assertEqual(reporter.retry('nope'), 0)
+
+    # ---------- 迁移与兼容 ----------
+
+    def test_migration_adds_columns_and_defaults_old_rows_to_pending(self):
+        old_db = self.root / 'old.db'
+        payload = json.dumps({'record': record(), 'detection': {'label': 'NO-Hardhat', 'confidence': .9},
+                              'index': 0, 'snapshot': str(self.snapshot), 'alertCode': 'ALT-AI-OLD'})
+        with closing(sqlite3.connect(old_db)) as db, db:
+            db.execute('CREATE TABLE outbox (id TEXT PRIMARY KEY, alert_code TEXT, payload TEXT, '
+                       'snapshot TEXT, attempts INTEGER DEFAULT 0, next_at REAL DEFAULT 0)')
+            db.execute('INSERT INTO outbox VALUES (?,?,?,?,0,0)',
+                       ('old-0', 'ALT-AI-OLD', payload, str(self.snapshot)))
+        reporter = self.reporter(FailingOpener(), outbox=old_db)
+        with closing(sqlite3.connect(old_db)) as db:
+            columns = {row[1] for row in db.execute('PRAGMA table_info(outbox)')}
+            state = db.execute("SELECT state FROM outbox WHERE id='old-0'").fetchone()[0]
+        self.assertTrue({'state', 'last_error', 'updated_at'} <= columns)
+        self.assertEqual(state, 'pending')
+        reporter.close()
+        # 重复迁移必须幂等
+        second = self.reporter(FailingOpener(), outbox=old_db)
+        second.close()
+
+    # ---------- 冷却弃用 ----------
+
+    def test_deprecated_cooldown_env_is_ignored(self):
+        output = StringIO()
+        with patch.dict(os.environ, {'KUANGSHAN_ALERT_COOLDOWN_SECONDS': '1'}), \
+                patch.object(alerts, 'settings', REAL_SETTINGS), \
+                patch.object(alerts, '_DEPRECATED_COOLDOWN_WARNED', False), \
+                redirect_stderr(output):
+            cfg = alerts.settings()
+            self.assertNotIn('cooldown', cfg)
+            self.assertIn('KUANGSHAN_ALERT_COOLDOWN_SECONDS', output.getvalue())
+        reporter = self.reporter(FailingOpener())
+        reporter.submit({**record(captured='2026-10-13T00:00:00+00:00'), 'id': 'evt-1'}, self.snapshot)
+        reporter.submit({**record(captured='2026-10-13T00:00:01+00:00'), 'id': 'evt-2'}, self.snapshot)
+        self.assertEqual(reporter.counts()['pending'], 2)
+
+    # ---------- 发送线程健壮性 ----------
+
+    def test_sqlite_error_keeps_worker_alive(self):
+        reporter = self.reporter(FailingOpener(fail_times=0))
+        original = reporter._claim
+
+        def locked():
+            raise sqlite3.OperationalError('database is locked')
+
+        reporter._claim = locked
+        time.sleep(0.8)
+        self.assertTrue(reporter.worker.is_alive(), 'SQLite 暂时不可用时发送线程不得退出')
+        self.assertEqual(reporter.status()['state'], 'error')
+        reporter._claim = original
+        reporter.submit(record(), self.snapshot)
+        self.assertTrue(self.wait_counts(reporter, pending=0, dead=0, timeout=10))
+
+    # ---------- 结束与恢复 ----------
+
+    def test_pending_survives_restart_and_is_delivered(self):
+        outbox = self.root / 'restart.db'
+        first = self.reporter(FailingOpener(), outbox=outbox)
+        first.submit(record(), self.snapshot)
+        self.assertTrue(self.wait_counts(first, pending=1))
+        first.close()
+
+        healthy = FailingOpener(fail_times=0)
+        second = self.reporter(healthy, outbox=outbox)
+        self.assertTrue(self.wait_counts(second, pending=0, dead=0, timeout=10))
+        self.assertGreaterEqual(healthy.calls, 1)
+        self.assertEqual(second.reported, 1)
 
     def test_close_drains_pending_before_exit(self):
-        """停止时应尽力把已入队的告警发完，而不是留到下次启动。"""
         opener = FailingOpener(fail_times=0)
-        reporter = alerts.AlertReporter({'id': 'A', 'cameraName': 't'}, self.root,
-                                        opener=opener, outbox_path=self.root / 'a.db')
+        reporter = alerts.AlertReporter({'id': 'A'}, self.root, opener=opener,
+                                        outbox_path=self.root / 'drain.db')
         reporter.submit(record(), self.snapshot)
-        reporter.close()          # 不额外等待，close 自身应有界排空
-        with closing(sqlite3.connect(self.root / 'a.db')) as db:
-            remaining = db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0]
-        self.assertEqual(remaining, 0, '关闭时应发完待发送记录')
-        self.assertGreaterEqual(opener.calls, 1)
+        reporter.close()
+        with closing(sqlite3.connect(self.root / 'drain.db')) as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0], 0)
 
     def test_close_bounded_when_endpoint_down(self):
-        """接口不可用时，关闭不能无限阻塞；记录保留在 outbox 待下次补发。"""
         opener = FailingOpener()
-        reporter = alerts.AlertReporter({'id': 'A', 'cameraName': 't'}, self.root,
-                                        opener=opener, outbox_path=self.root / 'a.db')
+        reporter = alerts.AlertReporter({'id': 'A'}, self.root, opener=opener,
+                                        outbox_path=self.root / 'bound.db')
         reporter.submit(record(), self.snapshot)
         start = time.monotonic()
         reporter.close(drain_seconds=1)
-        self.assertLess(time.monotonic() - start, 6, '关闭应有界返回')
-        with closing(sqlite3.connect(self.root / 'a.db')) as db:
-            self.assertEqual(db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0], 1,
-                             '未发出的记录应保留待补发')
+        self.assertLess(time.monotonic() - start, 6)
+        with closing(sqlite3.connect(self.root / 'bound.db')) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM outbox WHERE state='pending'").fetchone()[0], 1)
 
     def test_disabled_without_endpoint(self):
         with patch.object(alerts, 'settings', lambda: {'enabled': False}):
             reporter = alerts.AlertReporter({'id': 'A'}, self.root)
             self.assertEqual(reporter.status()['state'], 'disabled')
-            reporter.submit(record(), self.snapshot)
-            self.assertEqual(reporter.pending(), 0)
-
-    # ---------- 截图缺失不永久阻塞 ----------
-
-    def test_missing_snapshot_is_dropped(self):
-        opener = FailingOpener(fail_times=0)
-        reporter = alerts.AlertReporter({'id': 'A', 'cameraName': 't'}, self.root,
-                                        opener=opener, outbox_path=self.root / 'a.db')
-        try:
-            reporter.submit(record(), self.snapshot)
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline and reporter.pending():
-                time.sleep(.2)
-            self.assertEqual(reporter.pending(), 0)
-        finally:
+            self.assertEqual(reporter.submit(record(), self.snapshot)['queued'], 0)
             reporter.close()
 
 

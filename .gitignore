@@ -9,3 +9,6 @@ analysis-service/.venv/
 kstool/mediamtx/bin/
 kstool/mediamtx/runtime/
 kstool/mediamtx/auto.key
+
+# 数据库备份不入库
+backups/

@@ -42,19 +42,27 @@
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `KUANGSHAN_ALERT_API_URL` | 空（禁用） | Java `POST /api/alerts` 地址 |
-| `KUANGSHAN_ALERT_COOLDOWN_SECONDS` | 60 | 同一事件的告警冷却 |
 | `KUANGSHAN_ALERT_TIMEOUT_SECONDS` | 5 | 单次上报超时 |
 | `KUANGSHAN_ALERT_UPLOAD_ROOT` | `D:\kuangshanai-uploads` | 证据图落盘根目录 |
 | `KUANGSHAN_ALERT_UPLOAD_PREFIX` | `/uploads` | 返回给 Java 的 URL 前缀 |
 
-上报可靠性：待发送记录写入 SQLite outbox（`data/outbox/<视频>/`），失败按
-1/2/5/10/30 秒退避重试，**服务重启后仍会补发**；停止分析时会先尽力发完再退出，
-发送不完的记录留在 outbox 等下次启动。`alertCode` 跨运行稳定且**同一帧内每个目标
-各自独立编号**，Java 侧按唯一 `alert_code` 幂等去重。4xx（除 429）视为不可重试，
-避免无效高频重试。
+`KUANGSHAN_ALERT_COOLDOWN_SECONDS` 已弃用：告警冷却统一由业务层（任务/区域/目标维度）
+负责，桥接层不再按事件类型丢弃已接受事件；启动时若检测到该变量会提示并忽略。
+检测没有跟踪编号时只能按类别冷却，无法区分同一类别下的不同目标，页面会注明该限制。
 
-事件记录页可直接**导出 CSV**（带 UTF-8 BOM，Excel 打开不乱码），并在顶部显示
-告警桥状态（已发送 / 待发送 / 失败）。
+上报可靠性：待发送记录写入 SQLite outbox（`data/outbox/<视频>/outbox.db`），
+`state` 为 `pending`（等待/重试）或 `dead`（需要人工处理）。超时、连接错误、429、5xx
+按 1/2/5/10/30 秒退避保持 pending；其他 4xx、重定向、坏负载与证据缺失标记 dead，
+不再自动重试。**服务重启后 pending 仍会补发**；停止分析时会先尽力发完再退出。
+`alertCode` 跨运行稳定且**同一帧内每个目标各自独立编号**，Java 侧按唯一
+`alert_code` 幂等去重。
+
+事件记录页显示本次启动发送/失败尝试、持久化待发送与待处理数量，并列出 dead 记录，
+可对指定行人工重试（`POST /api/alerts/retry`，列表 `GET /api/alerts/outbox`）；
+对应视频未运行时只重新排队，并在下次启动分析后发送。outbox 表结构迁移幂等，
+迁移前备份与回滚边界见 `backups/2026-10-17-batch5/migration-notes.md`。
+
+事件记录页可直接**导出 CSV**（带 UTF-8 BOM，Excel 打开不乱码）。
 
 ## 容量与稳定性
 
@@ -81,7 +89,7 @@
 - `service.py` 取流、调度、结果与证据落盘
 - `console.py` / `console.html` / `console.js` / `console.css` 本机管理台
 - `capture.py` 封面截帧
-- `alerts.py` 可选 Java 预警上报（SQLite outbox + 退避重试）
+- `alerts.py` 可选 Java 预警上报（SQLite outbox：pending/dead、退避重试、人工重试、幂等编号）
 - `weights/` 本地模型权重
 - `kstool/` 演示视频与 MediaMTX/FFmpeg 推流工具（素材根目录，可用 `KUANGSHAN_MEDIA_ROOT` 指向其他位置）
 

@@ -134,7 +134,10 @@ class Engine(Dispatcher):
         current = time.monotonic()
         accepted = []
         for d in alarms:
-            key = (algo_name, d.get('regionId', ''), d.get('trackId', d['label']))
+            track = d.get('trackId')
+            # 无跟踪编号时只能按类别冷却：不伪造目标身份，界面与文档已说明该限制。
+            identity = track if track is not None else ('label', d['label'])
+            key = (algo_name, d.get('regionId', ''), identity)
             if current - self.last_alert.get(key, -1e9) >= task['cooldown']:
                 accepted.append(d)
                 self.last_alert[key] = current
@@ -182,7 +185,9 @@ class Engine(Dispatcher):
                     with closing(sqlite3.connect(self.database, timeout=10)) as db, db:
                         db.execute('INSERT INTO alerts VALUES (?,?,?,?)',
                                    (evidence['id'], self.camera['id'], captured, json.dumps(evidence, ensure_ascii=False)))
-                self.alerts.submit(evidence, path)
+                result = self.alerts.submit(evidence, path)
+                if result.get('error'):
+                    self.event('alert_rejected', reason=result['error'])
             self.count += 1
             if self.count % 60 == 0:
                 self._cleanup_frames()

@@ -1,8 +1,12 @@
 """把分析结果异步上报到 Java 告警 API（可选）。
 
 可靠性设计：截图先落盘，再把待发送记录写入 SQLite outbox，最后异步发送。
-服务重启后未发送记录仍在 outbox 中，会继续按退避重试；同一记录复用同一
-alertCode，Java 侧按唯一 alert_code 幂等去重。
+outbox 行状态为 pending / dead：永久错误（4xx、重定向、坏负载、证据缺失）标记
+dead 供人工重试；临时错误保持 pending 按退避重试。服务重启后未发送记录仍在
+outbox 中；同一记录复用同一 alertCode，Java 侧按唯一 alert_code 幂等去重。
+
+冷却由业务层（Engine.collect）统一负责；桥接层不再按事件类型丢弃已接受事件，
+KUANGSHAN_ALERT_COOLDOWN_SECONDS 已弃用。
 """
 from contextlib import closing
 from datetime import datetime
@@ -12,21 +16,28 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import sys
 import threading
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
+_DEPRECATED_COOLDOWN_WARNED = False
+
 
 class AlertReportError(ValueError):
-    """fatal=True 表示不可重试（如认证/4xx），避免对配置错误无限高频重试。"""
+    """fatal=True 表示不可重试（4xx、重定向、坏负载、证据缺失）。"""
     fatal = False
+
+
+class RedirectRejected(AlertReportError):
+    fatal = True
 
 
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
-        raise AlertReportError('告警接口发生重定向，已拒绝')
+        raise RedirectRejected('告警接口发生重定向，已拒绝')
 
 
 def _number_env(name, default, minimum, maximum):
@@ -40,15 +51,19 @@ def _number_env(name, default, minimum, maximum):
 
 
 def settings():
+    global _DEPRECATED_COOLDOWN_WARNED
     url = os.environ.get('KUANGSHAN_ALERT_API_URL', '').strip()
-    cooldown = _number_env('KUANGSHAN_ALERT_COOLDOWN_SECONDS', '60', 0, 3600)
     timeout = _number_env('KUANGSHAN_ALERT_TIMEOUT_SECONDS', '5', 1, 30)
     upload_root = Path(os.environ.get(
         'KUANGSHAN_ALERT_UPLOAD_ROOT', r'D:\kuangshanai-uploads')).expanduser()
     prefix = os.environ.get('KUANGSHAN_ALERT_UPLOAD_PREFIX', '/uploads').strip().rstrip('/')
+    if not _DEPRECATED_COOLDOWN_WARNED and os.environ.get('KUANGSHAN_ALERT_COOLDOWN_SECONDS'):
+        _DEPRECATED_COOLDOWN_WARNED = True
+        print('提示：KUANGSHAN_ALERT_COOLDOWN_SECONDS 已弃用，告警冷却由业务层统一负责，'
+              '该变量将被忽略。', file=sys.stderr, flush=True)
     if not url:
         return {
-            'enabled': False, 'url': '', 'cooldown': cooldown, 'timeout': timeout,
+            'enabled': False, 'url': '', 'timeout': timeout,
             'uploadRoot': str(upload_root), 'uploadPrefix': prefix or '/uploads'}
     parsed = urlsplit(url)
     if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or \
@@ -59,7 +74,7 @@ def settings():
     if not prefix.startswith('/'):
         raise AlertReportError('KUANGSHAN_ALERT_UPLOAD_PREFIX 必须以 / 开头')
     return {
-        'enabled': True, 'url': url.rstrip('/'), 'cooldown': cooldown, 'timeout': timeout,
+        'enabled': True, 'url': url.rstrip('/'), 'timeout': timeout,
         'uploadRoot': str(upload_root), 'uploadPrefix': prefix or '/uploads'}
 
 
@@ -123,10 +138,26 @@ def build_payload(camera, record, detection, index, snapshot_path, alert_code):
     }
 
 
+def _ensure_schema(db):
+    """幂等迁移：旧 outbox 表补 state/last_error/updated_at，旧行默认 pending。"""
+    db.execute('''CREATE TABLE IF NOT EXISTS outbox (
+        id TEXT PRIMARY KEY, alert_code TEXT, payload TEXT, snapshot TEXT,
+        attempts INTEGER DEFAULT 0, next_at REAL DEFAULT 0,
+        state TEXT DEFAULT 'pending', last_error TEXT DEFAULT '', updated_at REAL DEFAULT 0)''')
+    columns = {row[1] for row in db.execute('PRAGMA table_info(outbox)')}
+    for name, definition in (('state', "TEXT DEFAULT 'pending'"),
+                             ('last_error', "TEXT DEFAULT ''"),
+                             ('updated_at', 'REAL DEFAULT 0')):
+        if name not in columns:
+            db.execute('ALTER TABLE outbox ADD COLUMN %s %s' % (name, definition))
+    db.execute("UPDATE outbox SET state='pending' WHERE state IS NULL OR state=''")
+
+
 class AlertReporter:
     """异步、可重试、可重启恢复的告警上报器。
 
     待发送记录写入 SQLite outbox（而非内存队列），因此进程重启后仍能补发。
+    dead 记录不自动重试，等待人工重试接口。
     """
 
     # 上报失败退避序列（秒），超过末项后固定为末项。
@@ -140,7 +171,6 @@ class AlertReporter:
         self.failed = 0
         self.state = 'disabled'
         self.message = ''
-        self.last_sent = {}
         self.stop = threading.Event()
         self.worker = None
         self.max_pending = max_pending
@@ -164,79 +194,104 @@ class AlertReporter:
         self.database.parent.mkdir(parents=True, exist_ok=True)
         with closing(sqlite3.connect(self.database, timeout=10)) as db, db:
             db.execute('PRAGMA journal_mode=WAL')
-            db.execute('''CREATE TABLE IF NOT EXISTS outbox (
-                id TEXT PRIMARY KEY, alert_code TEXT, payload TEXT, snapshot TEXT,
-                attempts INTEGER DEFAULT 0, next_at REAL DEFAULT 0)''')
+            _ensure_schema(db)
         self.state = 'idle'
         self.opener = opener or build_opener(NoRedirect()).open
         self.worker = threading.Thread(target=self._loop, daemon=True)
         self.worker.start()
 
-    # ==================== 状态 ====================
+    # ==================== 状态与计数 ====================
 
-    def _pending(self):
+    def counts(self):
+        """直接读取持久化队列的 pending/dead 数量。"""
         if not self.database:
-            return 0
+            return {'pending': 0, 'dead': 0}
         with closing(sqlite3.connect(self.database, timeout=10)) as db:
-            return db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0]
+            rows = db.execute('SELECT state, COUNT(*) FROM outbox GROUP BY state').fetchall()
+        result = {'pending': 0, 'dead': 0}
+        for state, count in rows:
+            if state in result:
+                result[state] = int(count)
+        return result
+
+    def pending(self):
+        return self.counts()['pending']
+
+    def dead(self):
+        return self.counts()['dead']
 
     def status(self):
         with self.lock:
             info = {
                 'state': self.state, 'reported': self.reported, 'failed': self.failed,
                 'message': self.message}
-        info['pending'] = self._pending()
+        try:
+            info.update(self.counts())
+        except sqlite3.Error:
+            info.update({'pending': None, 'dead': None})
         return info
 
     # ==================== 入队 ====================
 
     def submit(self, record, snapshot_file):
+        """把一条本地事件的所有目标作为一个事务入队；返回 {queued, error}。"""
         if not self.cfg.get('enabled'):
-            return
+            return {'queued': 0}
         detections = record.get('detections') or []
         if not detections:
-            return
-        event_id = record.get('eventId') or record.get('modelId')
-        now = time.monotonic()
-        if now - self.last_sent.get(event_id, -10**9) < self.cfg['cooldown']:
-            return
-        self.last_sent[event_id] = now
-
+            return {'queued': 0}
+        snapshot = Path(snapshot_file)
+        missing = not snapshot.is_file()
+        durable = None
+        if not missing:
+            try:
+                # 先把截图复制到 outbox 自身目录，避免待发送记录指向被轮转删除的帧。
+                suffix = snapshot.suffix.lower() if snapshot.suffix.lower() in ('.jpg', '.jpeg', '.png') else '.jpg'
+                durable = self.media / f"{record.get('id') or record.get('frameId', 'frame')}{suffix}"
+                shutil.copy2(snapshot, durable)
+            except OSError:
+                missing = True
         try:
-            snapshot = Path(snapshot_file)
-            if not snapshot.is_file():
-                raise OSError('证据截图不存在')
-            # 先把截图复制到 outbox 自身的目录，确保待发送记录不会指向被轮转删除的帧。
-            # 证据图是 JPEG 字节，扩展名必须一致，否则下载后无法直接打开。
-            suffix = snapshot.suffix.lower() if snapshot.suffix.lower() in ('.jpg', '.jpeg', '.png') else '.jpg'
-            durable = self.media / f"{record.get('id') or record.get('frameId', 'frame')}{suffix}"
-            shutil.copy2(snapshot, durable)
-            if self._pending() + len(detections) > self.max_pending:
+            if self.pending() + len(detections) > self.max_pending:
                 with self.lock:
                     self.state = 'degraded'
-                    self.message = f'待发送告警已达上限 {self.max_pending}'
+                    self.message = f'待发送告警已达上限 {self.max_pending}，本次事件未入队'
                     self.failed += 1
-                return
-            # 每条检测独立入队并各自持有编号：同一帧内的多个目标互不覆盖，
-            # 单条失败也只需重试那一条。
+                return {'queued': 0, 'error': self.message}
+            now_ts = time.time()
+            queued = 0
             with closing(sqlite3.connect(self.database, timeout=10)) as db, db:
                 for index, detection in enumerate(detections):
                     code = self.alert_code(record, detection, index)
                     payload = json.dumps(
                         {'record': record, 'detection': detection, 'index': index,
-                         'snapshot': str(durable), 'alertCode': code}, ensure_ascii=False)
+                         'snapshot': str(durable) if durable else str(snapshot),
+                         'alertCode': code}, ensure_ascii=False)
                     db.execute(
-                        'INSERT OR IGNORE INTO outbox (id, alert_code, payload, snapshot, attempts, next_at) '
-                        'VALUES (?,?,?,?,0,0)',
-                        (f"{record.get('id') or record.get('frameId')}-{index}",
-                         code, payload, str(durable)))
+                        'INSERT OR IGNORE INTO outbox '
+                        '(id, alert_code, payload, snapshot, attempts, next_at, state, last_error, updated_at) '
+                        'VALUES (?,?,?,?,0,0,?,?,?)',
+                        (f"{record.get('id') or record.get('frameId')}-{index}", code, payload,
+                         str(durable) if durable else str(snapshot),
+                         'dead' if missing else 'pending',
+                         '证据截图不存在，已保留记录待处理' if missing else '', now_ts))
+                    queued += 1 if db.execute('SELECT changes()').fetchone()[0] else 0
             with self.lock:
-                self.state = 'queued'
+                if missing:
+                    self.state = 'degraded'
+                    self.message = '证据截图不存在，告警已保留为待处理'
+                    self.failed += 1
+                else:
+                    self.state = 'queued'
+            if missing:
+                return {'queued': 0, 'error': self.message}
+            return {'queued': queued}
         except (OSError, sqlite3.Error):
             with self.lock:
                 self.state = 'error'
                 self.message = '告警入队失败：磁盘或数据库写入错误'
                 self.failed += 1
+            return {'queued': 0, 'error': self.message}
 
     # ==================== 幂等码 ====================
 
@@ -256,82 +311,136 @@ class AlertReporter:
             detection.get('trackId', '')))
         return 'ALT-AI-' + hashlib.sha256(source.encode('utf-8')).hexdigest()[:32].upper()
 
-    def close(self, drain_seconds=5):
-        """停止上报线程；先尽力发送已入队记录，再退出。
+    # ==================== 人工重试 ====================
 
-        直接置位 stop 会让刚刚入队的告警留到下次启动才补发，用户主动停止
-        分析后可能长时间收不到告警。这里给一个有界排空窗口：能在窗口内发完
-        就发完，超时则保留在 outbox 等下次启动补发（持久化保证不丢）。
-        接口不可用时 pending 不会清零，因此窗口到期即返回，不会卡住退出。
-        """
+    def retry(self, outbox_id):
+        """只把 dead 记录改回 pending 并立即到期；返回受影响行数。"""
+        if not self.database:
+            return 0
+        try:
+            with closing(sqlite3.connect(self.database, timeout=10)) as db, db:
+                cursor = db.execute(
+                    "UPDATE outbox SET state='pending', attempts=0, next_at=0, "
+                    "last_error='', updated_at=? WHERE id=? AND state='dead'",
+                    (time.time(), str(outbox_id)))
+                return int(cursor.rowcount)
+        except sqlite3.Error:
+            return 0
+
+    # ==================== 发送线程 ====================
+
+    def close(self, drain_seconds=5):
+        """停止上报线程；先尽力发送 pending 记录，再退出。dead 不阻塞退出。"""
         if self.database:
             deadline = time.monotonic() + drain_seconds
-            while time.monotonic() < deadline and self._pending():
-                time.sleep(.1)
+            try:
+                while time.monotonic() < deadline and self.pending():
+                    time.sleep(.1)
+            except sqlite3.Error:
+                pass
         self.stop.set()
         if self.worker:
             self.worker.join(timeout=3)
 
     def _loop(self):
         while not self.stop.is_set():
-            record = self._claim()
+            try:
+                record = self._claim()
+            except sqlite3.Error:
+                with self.lock:
+                    self.state = 'error'
+                    self.message = '本地告警队列暂时不可用，稍后重试'
+                self.stop.wait(2)
+                continue
             if record is None:
                 self.stop.wait(0.2)
                 continue
             try:
                 self._post(record)
+            except AlertReportError as exc:
+                self._record_failure(record, exc, fatal=exc.fatal)
+                continue
+            except Exception:
+                self._record_failure(record, AlertReportError('告警上报失败'), fatal=False)
+                continue
+            try:
                 with closing(sqlite3.connect(self.database, timeout=10)) as db, db:
                     db.execute('DELETE FROM outbox WHERE id=?', (record['id'],))
                 with self.lock:
                     self.reported += 1
                     self.state = 'success'
                     self.message = ''
-            except AlertReportError as exc:
-                self._failed(record, exc, fatal=exc.fatal)
-            except Exception:
-                self._failed(record, AlertReportError('告警上报失败'), fatal=False)
+            except sqlite3.Error:
+                with self.lock:
+                    self.state = 'error'
+                    self.message = '发送成功但本地队列更新失败，将按同一编号重发'
+                self.stop.wait(1)
+
+    def _record_failure(self, record, exc, fatal):
+        try:
+            self._failed(record, exc, fatal)
+        except sqlite3.Error:
+            with self.lock:
+                self.state = 'error'
+                self.message = '本地告警队列暂时不可用，稍后重试'
+            self.stop.wait(2)
 
     def _claim(self):
-        """取出一条到期记录并占用它（attempts 自增），保证不重复发送。"""
+        """取出一条到期 pending 记录并占用（attempts 自增）；坏负载标记 dead。"""
         with closing(sqlite3.connect(self.database, timeout=10)) as db, db:
             row = db.execute(
-                'SELECT id, payload, attempts FROM outbox WHERE next_at<=? ORDER BY next_at LIMIT 1',
+                "SELECT id, payload, attempts FROM outbox "
+                "WHERE state='pending' AND next_at<=? ORDER BY next_at LIMIT 1",
                 (time.time(),)).fetchone()
             if not row:
                 return None
+            try:
+                data = json.loads(row[1])
+            except ValueError:
+                db.execute(
+                    "UPDATE outbox SET state='dead', last_error=?, updated_at=? WHERE id=?",
+                    ('负载无法解析，已保留原始记录', time.time(), row[0]))
+                return None
+            if not isinstance(data, dict):
+                db.execute(
+                    "UPDATE outbox SET state='dead', last_error=?, updated_at=? WHERE id=?",
+                    ('负载结构不合法，已保留原始记录', time.time(), row[0]))
+                return None
             db.execute('UPDATE outbox SET attempts=attempts+1 WHERE id=?', (row[0],))
-        return {'id': row[0], **json.loads(row[1]), 'attempts': row[2] + 1}
+        return {'id': row[0], **data, 'attempts': row[2] + 1}
 
     def _failed(self, record, exc, fatal):
-        """记录失败并按退避重排；不可重试的错误只保留一次尝试。"""
-        delay = self.BACKOFF[min(record['attempts'] - 1, len(self.BACKOFF) - 1)]
-        with closing(sqlite3.connect(self.database, timeout=10)) as db, db:
-            if fatal:
-                db.execute('UPDATE outbox SET next_at=? WHERE id=?', (time.time() + 3600, record['id']))
-            else:
-                db.execute('UPDATE outbox SET next_at=? WHERE id=?', (time.time() + delay, record['id']))
+        """永久错误标记 dead；临时错误按退避重排。"""
+        now_ts = time.time()
+        if fatal:
+            with closing(sqlite3.connect(self.database, timeout=10)) as db, db:
+                db.execute(
+                    "UPDATE outbox SET state='dead', last_error=?, updated_at=? WHERE id=?",
+                    (str(exc)[:500], now_ts, record['id']))
+        else:
+            delay = self.BACKOFF[min(record['attempts'] - 1, len(self.BACKOFF) - 1)]
+            with closing(sqlite3.connect(self.database, timeout=10)) as db, db:
+                db.execute(
+                    "UPDATE outbox SET next_at=?, last_error=?, updated_at=? WHERE id=?",
+                    (now_ts + delay, str(exc)[:500], now_ts, record['id']))
         with self.lock:
             self.failed += 1
             self.state = 'error'
             self.message = str(exc)
 
-    def pending(self):
-        """待发送记录数（含尚未到重试时间的）。"""
-        return self._pending()
     def _post(self, record):
         data = record['record']
         detection = record.get('detection') or {}
         snapshot = Path(record['snapshot'])
         if not snapshot.is_file():
-            # 证据截图丢失，继续持有只会永远失败：清除该条，避免长期占用队列。
-            with closing(sqlite3.connect(self.database, timeout=10)) as db, db:
-                db.execute('DELETE FROM outbox WHERE id=?', (record['id'],))
-            raise AlertReportError('证据截图已丢失，跳过该告警') from None
+            # 证据截图丢失属于永久错误：保留记录并标记 dead，避免无限重试。
+            error = AlertReportError('证据截图已丢失，告警保留为待处理')
+            error.fatal = True
+            raise error
         upload_root = Path(self.cfg['uploadRoot'])
         day = datetime.now().strftime('%Y/%m/%d')
         dest_dir = upload_root / 'snapshots' / day
         dest_dir.mkdir(parents=True, exist_ok=True)
-        # 组内截图共用同一份文件；文件名按 outbox 记录 ID 唯一，避免同帧多目标互相覆盖。
         name = f"{record['id']}{snapshot.suffix.lower()}"
         dest = dest_dir / name
         if not dest.exists():
@@ -353,4 +462,3 @@ class AlertReporter:
             raise error from None
         except (TimeoutError, URLError, OSError):
             raise AlertReportError('告警接口超时或不可用') from None
-
