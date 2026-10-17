@@ -130,6 +130,10 @@ class Controller:
                     if now - started > INITIAL_TIMEOUT_SECONDS:
                         self._fail(cid, generation, '初始化超时')
                     continue
+            if scope is not None and lifecycle in ('starting', 'active') and not scope.main_alive():
+                # 服务主进程退出时，派生的分析进程可能仍在写心跳；仍按意外退出处理。
+                self._fail(cid, generation, '服务进程退出')
+                continue
             seq = self._heartbeat_seq(cid)
             active = scope.active_process_count() if scope else 0
             if lifecycle == 'starting':

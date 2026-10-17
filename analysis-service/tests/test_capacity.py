@@ -20,10 +20,14 @@ class FakeScope:
 
     def __init__(self, command, log, cwd=None):
         self.active = 1
+        self.main = True
         self.terminated = False
         self.closed = False
         self.pid = 40000 + len(FakeScope.instances)
         FakeScope.instances.append(self)
+
+    def main_alive(self):
+        return self.main and not self.terminated and not self.closed
 
     def active_process_count(self):
         return 0 if (self.terminated or self.closed) else self.active
@@ -140,6 +144,19 @@ class CapacityTests(unittest.TestCase):
         self.c._check_jobs()
         self.assertEqual(job['lifecycle'], 'backoff')
         self.assertEqual(job['lastFailure'], '意外退出')
+
+    def test_service_process_exit_enters_backoff(self):
+        """主进程退出但派生工作进程仍存活、心跳仍前进时，也必须重建。"""
+        cid = self.add('服务退出')['id']
+        self.c.start(cid)
+        job = self.c.jobs[cid]
+        self.write_status(cid, heartbeat=1)
+        self.c._check_jobs()
+        self.assertEqual(job['lifecycle'], 'active')
+        FakeScope.instances[-1].main = False
+        self.c._check_jobs()
+        self.assertEqual(job['lifecycle'], 'backoff')
+        self.assertEqual(job['lastFailure'], '服务进程退出')
 
     def test_restart_budget_reaches_failed(self):
         cid = self.add('预算')['id']

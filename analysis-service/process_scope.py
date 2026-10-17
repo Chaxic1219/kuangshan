@@ -307,6 +307,10 @@ class ProcessScope:
             time.sleep(0.05)
         return False
 
+    def main_alive(self):
+        """作业主进程（service.py）是否仍存活；派生工作进程存活不算。"""
+        return self.pid is not None and pid_alive(self.pid)
+
     def wait_for_zero(self, timeout=5.0):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:

@@ -18,6 +18,7 @@ from catalog import MEDIA_ROOT
 from console import Controller
 
 PROCESS_SUSPEND_RESUME = 0x0800
+PROCESS_TERMINATE = 0x0001
 
 if os.name == 'nt':
     ntdll = ctypes.WinDLL('ntdll')
@@ -27,6 +28,19 @@ if os.name == 'nt':
     kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_bool, ctypes.c_ulong]
     kernel32.OpenProcess.restype = ctypes.c_void_p
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    kernel32.TerminateProcess.restype = ctypes.c_int
+
+
+def terminate_pid(pid):
+    """只终止指定进程，不触碰其派生进程或作业。"""
+    handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, int(pid))
+    if not handle:
+        return False
+    try:
+        return bool(kernel32.TerminateProcess(handle, 1))
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def suspend_process(pid):
@@ -113,6 +127,18 @@ class RealLifecycleTests(unittest.TestCase):
         self.assertEqual(job['lifecycle'], 'backoff')
         self.assertEqual(job['lastFailure'], '初始化超时')
         self.assertIsNone(job['scope'])
+        self.c.stop(cid)
+
+    def test_service_process_exit_is_detected(self):
+        """只终止 service.py 主进程、保留派生工作进程和心跳 → 仍须判定为故障。"""
+        cid = self.add(MEDIA_ROOT/'mediamtx/videos/camera1.mp4')['id']
+        self.c.start(cid)
+        job = self.wait_active(cid)
+        self.assertTrue(terminate_pid(job['scope'].pid), '未能终止服务主进程')
+        time.sleep(0.4)
+        self.c._check_jobs()
+        self.assertEqual(job['lifecycle'], 'backoff')
+        self.assertEqual(job['lastFailure'], '服务进程退出')
         self.c.stop(cid)
 
 
