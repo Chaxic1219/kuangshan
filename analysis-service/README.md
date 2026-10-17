@@ -61,7 +61,10 @@
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `KUANGSHAN_MAX_RUNNING` | 6 | 同时运行的视频上限，超出时明确拒绝 |
-| `KUANGSHAN_WATCHDOG_SECONDS` | 30 | 心跳停止超过该秒数则重建该路进程 |
+| `KUANGSHAN_WATCHDOG_SECONDS` | 30 | 心跳序号停止前进超过该秒数则重建该路进程 |
+| `KUANGSHAN_INITIAL_TIMEOUT_SECONDS` | 60 | 进程启动后首个心跳的期限，超时视为初始化卡死 |
+
+每路视频是一个 Windows 作业对象（Job Object）：控制台异常退出或关闭最后句柄时，该路进程组随之终止；同一数据目录只允许一个控制台实例（命名互斥量），不同数据目录可并行。故障后按 1/2/5/10/30 秒退避自动恢复，十分钟内最多自动重启 5 次，超限进入 `failed` 并等待人工启动；`/api/state` 的 `lifecycle`（starting/active/stopping/backoff/failed/stopped）、`lastFailure`、`nextRestartIn` 会返回给页面，暂停状态不会被展示成正常运行。
 
 每路视频一个进程并各自加载权重，并发数直接决定内存与 CPU 占用；卡死时只重建
 受影响的那一路，其他路继续运行（同路多个场景会一起短暂重启，这是首版的隔离边界）。

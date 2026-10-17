@@ -17,10 +17,14 @@ class ConsoleTests(unittest.TestCase):
             probe=c.probe(url)
             saved=c.save({'id':'','name':'视频一','url':url,'tasks':[],**probe})
             self.assertTrue((Path(folder)/saved['cover'].lstrip('/')).is_file())
-            self.assertEqual(len(Controller(Path(folder)).store.cameras),1)
             with self.assertRaises(ValueError):
                 c.save({'name':'错地址','url':'rtsp://localhost/wrong','coverToken':probe['coverToken']})
             c.close()
+            reloaded = Controller(Path(folder))
+            try:
+                self.assertEqual(len(reloaded.store.cameras),1)
+            finally:
+                reloaded.close()
 
     def test_samples_use_posix_paths(self):
         with tempfile.TemporaryDirectory() as folder:

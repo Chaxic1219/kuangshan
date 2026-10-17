@@ -301,6 +301,7 @@ def camera_worker(camera, output, run_id, stop):
     reader.thread.start()
     state = None
     heartbeat = 0
+    heartbeat_seq = 0
     try:
         while not stop.wait(0.001):
             current, frame = reader.snapshot()
@@ -315,8 +316,11 @@ def camera_worker(camera, output, run_id, stop):
                 state = current
             if time.monotonic() - heartbeat >= 0.1:
                 usage = resource_usage()
+                # 心跳由实际工作循环推进，控制台据此区分“进程存活”和“推理卡死”。
+                heartbeat_seq += 1
                 atomic_json(engine.directory / 'status.json', {
                     'cameraId': camera['id'], 'state': state, 'results': engine.count, 'at': now(),
+                    'heartbeatSeq': heartbeat_seq,
                     'latest': engine.latest, 'modelErrors': engine.model_errors, 'alerts': engine.alerts.status(),
                     'resource': usage,
                     'live': (Path(camera['id']) / 'live.jpg').as_posix() if (engine.directory / 'live.jpg').is_file() else ''})

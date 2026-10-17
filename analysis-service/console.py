@@ -3,6 +3,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import copy
 from contextlib import closing
 from datetime import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ from urllib.parse import urlsplit, unquote
 import uuid
 from catalog import ROOT, Store, EVENTS, model_status, validate_camera, validate_source, atomic_json, identifier, MEDIA_ROOT, resolve_source
 from alerts import public_status
+import process_scope
 
 VIDEO_TYPES = {'.mp4': 'video/mp4', '.webm': 'video/webm', '.ogg': 'video/ogg', '.mov': 'video/quicktime'}
 
@@ -24,8 +26,24 @@ VIDEO_TYPES = {'.mp4': 'video/mp4', '.webm': 'video/webm', '.ogg': 'video/ogg', 
 # 超出上限时明确拒绝，而不是静默排队把机器拖垮。
 MAX_RUNNING = int(os.environ.get('KUANGSHAN_MAX_RUNNING', '6'))
 
-# 取流或推理永久卡住时，心跳文件停止更新；超过该秒数则重建该路进程。
+# 取流或推理永久卡住时，心跳序号停止前进；超过该秒数则重建该路进程。
 WATCHDOG_SECONDS = int(os.environ.get('KUANGSHAN_WATCHDOG_SECONDS', '30'))
+
+# 初始化期限：从进程创建开始计时，超过仍无首个心跳视为初始化卡死。
+INITIAL_TIMEOUT_SECONDS = float(os.environ.get('KUANGSHAN_INITIAL_TIMEOUT_SECONDS', '60'))
+
+# 故障自动恢复：退避序列、十分钟窗口内最多重启次数、稳定运行后清空预算。
+RESTART_BACKOFF = (1, 2, 5, 10, 30)
+RESTART_WINDOW_SECONDS = 600
+RESTART_LIMIT = 5
+STABLE_RESET_SECONDS = 600
+
+# 用户停止：先请求正常退出，超时后终止整个作业，再确认归零。
+STOP_WAIT_SECONDS = 18
+STOP_CONFIRM_SECONDS = 3
+
+# 处于这些状态的作业占并发名额；只有 stopped/failed 释放。
+LIFECYCLE_ADMITTED = ('starting', 'active', 'stopping', 'backoff')
 
 
 def read_json(path, default):
@@ -43,75 +61,218 @@ def preview_for(camera):
 
 
 class Controller:
-    def __init__(self, work):
+    def __init__(self, work, scope_factory=None):
         self.work = Path(work).resolve()
         self.store = Store(self.work)
         self.lock = threading.RLock()
         self.jobs = {}
         self.probes = {}
+        self.scope_factory = scope_factory or process_scope.ProcessScope
+        self._mutex = None
+        if scope_factory is None and process_scope.IS_WINDOWS:
+            name = 'Local\\kuangshan-analysis-' + hashlib.sha256(
+                str(self.work).lower().encode('utf-8')).hexdigest()[:16]
+            self._mutex = process_scope.SingleInstance(name)
         for name in ('covers', 'runtime', 'evidence', 'outbox'):
             (self.work/name).mkdir(exist_ok=True)
         self.database = self.work/'events.db'
         with closing(sqlite3.connect(self.database)) as db, db:
             db.execute('CREATE TABLE IF NOT EXISTS alerts (id TEXT PRIMARY KEY, camera TEXT, at TEXT, record TEXT)')
-        self.restarts = {}
         self.watchdog_stop = threading.Event()
         self.watchdog = threading.Thread(target=self._watch, daemon=True)
         self.watchdog.start()
 
-    # ==================== 看门狗 ====================
+    # ==================== 生命周期状态机 ====================
 
-    def _status_stale(self, cid):
-        """心跳文件是否已停止更新（取流或推理可能卡死）。"""
-        run = self.run_dir(cid)
-        if not run:
-            return False
-        status = read_json(run/cid/'status.json', {})
-        at = status.get('at')
-        if not at:
-            return False
-        try:
-            stamp = datetime.fromisoformat(at).timestamp()
-        except (TypeError, ValueError):
-            return False
-        return time.time() - stamp > WATCHDOG_SECONDS
+    @staticmethod
+    def _new_job(folder):
+        return {
+            'scope': None, 'folder': Path(folder), 'desiredRunning': False,
+            'generation': 0, 'lifecycle': 'stopped',
+            'startedMonotonic': 0.0, 'lastProgressMonotonic': 0.0,
+            'lastHeartbeatSeq': 0, 'restartHistory': [],
+            'lastRestartMonotonic': 0.0, 'nextRestartMonotonic': None,
+            'lastFailure': '',
+        }
 
     def _watch(self):
-        """定期检查运行中任务的心跳，卡死则重建该路；其他路不受影响。"""
+        """定期检查心跳与作业状态；卡死或意外退出时回收并安排恢复。"""
         while not self.watchdog_stop.wait(5):
             try:
-                for cid in list(self.jobs):
-                    if not self.running(cid) or not self._status_stale(cid):
-                        continue
-                    with self.lock:
-                        if not self.running(cid) or not self._status_stale(cid):
-                            continue
-                        self.restarts[cid] = self.restarts.get(cid, 0) + 1
-                        # 只操作本服务拥有的进程；重建期间该路短暂中断，
-                        # 同路模型会一起重启，这是首版明确的隔离边界。
-                        self._terminate(self.jobs[cid]['process'])
-                        self.jobs.pop(cid, None)
-                        try:
-                            self.start(cid)
-                        except (ValueError, OSError):
-                            pass
+                self._check_jobs()
             except Exception:
                 # 看门狗自身不得因单次异常而退出。
                 continue
 
-    def _terminate(self, process):
-        """先请求退出，超时后强制结束，避免留下孤儿进程。"""
-        if process.poll() is not None:
-            return
-        process.terminate()
+    def _lifecycle_is(self, cid, generation, expected):
+        job = self.jobs.get(cid)
+        return bool(job and job['generation'] == generation and job['lifecycle'] == expected)
+
+    def _admitted_locked(self):
+        return sum(1 for job in self.jobs.values() if job['lifecycle'] in LIFECYCLE_ADMITTED)
+
+    def _check_jobs(self):
+        now = time.monotonic()
+        with self.lock:
+            snapshot = [(cid, job, job['generation']) for cid, job in self.jobs.items()]
+        for cid, job, generation in snapshot:
+            with self.lock:
+                if self.jobs.get(cid) is not job or job['generation'] != generation:
+                    continue
+                lifecycle = job['lifecycle']
+                scope = job['scope']
+                started = job['startedMonotonic']
+                last_progress = job['lastProgressMonotonic']
+                desired = job['desiredRunning']
+                last_seq = job['lastHeartbeatSeq']
+                if lifecycle == 'starting' and scope is None:
+                    # 进程创建尚未完成：只检查初始化期限。
+                    if now - started > INITIAL_TIMEOUT_SECONDS:
+                        self._fail(cid, generation, '初始化超时')
+                    continue
+            seq = self._heartbeat_seq(cid)
+            active = scope.active_process_count() if scope else 0
+            if lifecycle == 'starting':
+                if seq > 0:
+                    with self.lock:
+                        if self._lifecycle_is(cid, generation, 'starting'):
+                            job['lifecycle'] = 'active'
+                            job['lastHeartbeatSeq'] = seq
+                            job['lastProgressMonotonic'] = now
+                            job['lastRestartMonotonic'] = now
+                elif active == 0:
+                    self._fail(cid, generation, '初始化前退出')
+                elif now - started > INITIAL_TIMEOUT_SECONDS:
+                    self._fail(cid, generation, '初始化超时')
+            elif lifecycle == 'active':
+                if seq > last_seq:
+                    with self.lock:
+                        if self._lifecycle_is(cid, generation, 'active'):
+                            job['lastHeartbeatSeq'] = seq
+                            job['lastProgressMonotonic'] = now
+                if active == 0:
+                    self._fail(cid, generation, '意外退出')
+                elif now - last_progress > WATCHDOG_SECONDS:
+                    self._fail(cid, generation, '执行超时')
+                elif job['restartHistory'] and now - job['lastRestartMonotonic'] > STABLE_RESET_SECONDS:
+                    with self.lock:
+                        if self._lifecycle_is(cid, generation, 'active'):
+                            job['restartHistory'] = []
+            elif lifecycle == 'backoff':
+                if not desired:
+                    self._fail(cid, generation, job['lastFailure'] or '已停止', recover_only=True)
+                elif job['nextRestartMonotonic'] and now >= job['nextRestartMonotonic']:
+                    self._restart(cid, generation)
+            elif lifecycle == 'stopping':
+                if active == 0:
+                    with self.lock:
+                        if self._lifecycle_is(cid, generation, 'stopping'):
+                            if job['scope']:
+                                job['scope'].close()
+                            job['scope'] = None
+                            job['lifecycle'] = 'stopped'
+
+    def _heartbeat_seq(self, cid):
+        run = self.run_dir(cid)
+        if not run:
+            return 0
+        status = read_json(run/cid/'status.json', {})
         try:
-            process.wait(timeout=6)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                pass
+            return int(status.get('heartbeatSeq') or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _fail(self, cid, generation, reason, recover_only=False):
+        """回收失败的作业代数；确认归零后按预算安排恢复，否则进入 failed。"""
+        now = time.monotonic()
+        with self.lock:
+            job = self.jobs.get(cid)
+            if not job or job['generation'] != generation:
+                return
+            scope = job['scope']
+            job['scope'] = None
+            job['lastFailure'] = reason
+            if not recover_only:
+                job['restartHistory'].append(now)
+                job['lastRestartMonotonic'] = now
+        recovered = True
+        if scope:
+            scope.terminate()
+            recovered = scope.wait_for_zero(STOP_CONFIRM_SECONDS)
+            scope.close()
+        with self.lock:
+            job = self.jobs.get(cid)
+            if not job or job['generation'] != generation:
+                return
+            if not recovered:
+                job['lifecycle'] = 'failed'
+                job['desiredRunning'] = False
+                job['lastFailure'] = reason + '（回收无法确认）'
+                job['nextRestartMonotonic'] = None
+                return
+            if not job['desiredRunning'] or recover_only:
+                job['lifecycle'] = 'stopped'
+                job['nextRestartMonotonic'] = None
+                return
+            recent = [t for t in job['restartHistory'] if now - t <= RESTART_WINDOW_SECONDS]
+            job['restartHistory'] = recent
+            if len(recent) > RESTART_LIMIT:
+                job['lifecycle'] = 'failed'
+                job['desiredRunning'] = False
+                job['lastFailure'] = reason + '（自动重启次数已达上限）'
+                job['nextRestartMonotonic'] = None
+                return
+            delay = RESTART_BACKOFF[min(len(recent) - 1, len(RESTART_BACKOFF) - 1)]
+            job['lifecycle'] = 'backoff'
+            job['nextRestartMonotonic'] = time.monotonic() + delay
+
+    def _restart(self, cid, generation):
+        with self.lock:
+            job = self.jobs.get(cid)
+            if not job or job['generation'] != generation or job['lifecycle'] != 'backoff':
+                return
+            if not job['desiredRunning']:
+                job['lifecycle'] = 'stopped'
+                return
+            job['generation'] += 1
+            new_generation = job['generation']
+            job['lifecycle'] = 'starting'
+            job['startedMonotonic'] = time.monotonic()
+            job['lastProgressMonotonic'] = time.monotonic()
+            job['lastHeartbeatSeq'] = 0
+            job['nextRestartMonotonic'] = None
+            job['lastFailure'] = ''
+            folder = job['folder']
+            config_path = folder/'config.json'
+        self._spawn(cid, new_generation, config_path, folder)
+
+    # ==================== 进程创建 ====================
+
+    def _spawn(self, cid, generation, config_path, folder):
+        command = [sys.executable, str(ROOT/'service.py'), '--config', str(config_path),
+                   '--output', str(folder), '--duration', '0']
+        log = folder/'service.log'
+        try:
+            scope = self.scope_factory(command, log, cwd=ROOT)
+        except Exception as exc:
+            with self.lock:
+                job = self.jobs.get(cid)
+                if job and job['generation'] == generation:
+                    job['lifecycle'] = 'failed'
+                    job['desiredRunning'] = False
+                    job['lastFailure'] = f'启动失败：{exc}'
+            raise ValueError('启动分析失败，请查看服务日志') from exc
+        with self.lock:
+            job = self.jobs.get(cid)
+            if not job or job['generation'] != generation or not job['desiredRunning']:
+                # 启动期间用户取消或已被新代次取代：回收本次作业。
+                scope.terminate()
+                scope.wait_for_zero(STOP_CONFIRM_SECONDS)
+                scope.close()
+                return
+            job['scope'] = scope
+
+    # ==================== 对外动作 ====================
 
     def probe(self, url):
         url = validate_source(url)
@@ -154,136 +315,191 @@ class Controller:
 
     def running(self, cid):
         job = self.jobs.get(cid)
-        return bool(job and job['process'].poll() is None)
+        return bool(job and job['lifecycle'] in LIFECYCLE_ADMITTED)
 
     def running_count(self):
-        return sum(1 for cid in list(self.jobs) if self.running(cid))
+        with self.lock:
+            return self._admitted_locked()
 
     def start(self, cid):
         camera = self.store.get(cid)
         if not camera:
             raise ValueError('视频不存在')
-        if self.running(cid):
-            return
-        # 容量上限：每路独占进程并各自加载权重，超过上限直接拒绝而非静默积压。
-        if self.running_count() >= MAX_RUNNING:
-            raise ValueError(f'同时运行的视频已达上限 {MAX_RUNNING} 路，请先停止其他视频')
         camera = validate_camera(camera)
         tasks = [t for t in camera['tasks'] if t['enabled']]
-        ready = {m['id'] for m in model_status() if m['ready']}
         if not tasks:
             raise ValueError('请先为视频绑定检测场景')
+        ready = {m['id'] for m in model_status() if m['ready']}
         if any(t['model'] not in ready for t in tasks):
             raise ValueError('所选场景的模型权重尚未验证')
         camera['eventDb'] = str(self.database)
         camera['cameraName'] = camera['name']
-        # outbox 按摄像头固定在 work/outbox/<id>，与每次运行的一次性目录解耦，
-        # 使停止/重启后未发送的告警仍能被找回并补发。
+        # outbox 按摄像头固定，与每次运行的一次性目录解耦，停止/重启后仍能补发。
         camera['outbox'] = str(self.work/'outbox'/cid/'outbox.db')
-        folder = self.work/'runtime'/cid/uuid.uuid4().hex
-        folder.mkdir(parents=True)
-        config = folder/'config.json'
-        atomic_json(config, {'cameras': [camera]})
-        log = (folder/'service.log').open('wb')
-        try:
-            process = subprocess.Popen([sys.executable, str(ROOT/'service.py'), '--config', str(config),
-                                        '--output', str(folder), '--duration', '0'],
-                                       stdout=log, stderr=subprocess.STDOUT,
-                                       creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
-        finally:
-            log.close()
-        self.jobs[cid] = {'process': process, 'folder': folder}
+        with self.lock:
+            job = self.jobs.get(cid)
+            if job and job['desiredRunning'] and job['lifecycle'] in LIFECYCLE_ADMITTED:
+                return
+            if self._admitted_locked() >= MAX_RUNNING:
+                raise ValueError(f'同时运行的视频已达上限 {MAX_RUNNING} 路，请先停止其他视频')
+            folder = self.work/'runtime'/cid/uuid.uuid4().hex
+            folder.mkdir(parents=True)
+            config = folder/'config.json'
+            atomic_json(config, {'cameras': [camera]})
+            job = self._new_job(folder)
+            self.jobs[cid] = job
+            job['desiredRunning'] = True
+            job['generation'] += 1
+            job['lifecycle'] = 'starting'
+            job['startedMonotonic'] = time.monotonic()
+            job['lastProgressMonotonic'] = time.monotonic()
+            job['lastHeartbeatSeq'] = 0
+            job['lastFailure'] = ''
+            job['restartHistory'] = []
+            job['nextRestartMonotonic'] = None
+            generation = job['generation']
+        self._spawn(cid, generation, config, folder)
 
     def run_dir(self, cid):
         job = self.jobs.get(cid)
         if not job:
             return None
-        return next((p for p in job['folder'].iterdir() if p.is_dir()), None)
+        try:
+            folders = [p for p in job['folder'].iterdir() if p.is_dir()]
+        except OSError:
+            return None
+        latest, stamp = None, -1.0
+        for folder in folders:
+            try:
+                mtime = folder.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > stamp:
+                latest, stamp = folder, mtime
+        return latest
 
     def stop(self, cid):
-        job = self.jobs.get(cid)
-        if not job or job['process'].poll() is not None:
-            return
-        deadline = time.monotonic()+6
-        run = self.run_dir(cid)
-        while run is None and time.monotonic() < deadline:
-            time.sleep(.1)
+        with self.lock:
+            job = self.jobs.get(cid)
+            if not job:
+                return
+            job['desiredRunning'] = False
+            job['nextRestartMonotonic'] = None
+            job['restartHistory'] = []
+            if job['lifecycle'] in ('stopped', 'failed') and job['scope'] is None:
+                job['lifecycle'] = 'stopped'
+                return
+            job['lifecycle'] = 'stopping'
+            generation = job['generation']
+            scope = job['scope']
+        if scope and scope.active_process_count() > 0:
             run = self.run_dir(cid)
-        if run:
-            (run/'STOP').touch()
-        try:
-            job['process'].wait(timeout=18)
-        except subprocess.TimeoutExpired:
-            # 优雅停止超时：强制结束，避免关闭时留下孤儿取流进程。
-            self._terminate(job['process'])
-            raise ValueError('停止超时，已强制结束该路进程，请查看服务日志') from None
+            deadline = time.monotonic() + 6
+            while run is None and time.monotonic() < deadline:
+                time.sleep(.1)
+                run = self.run_dir(cid)
+            if run:
+                (run/'STOP').touch()
+        zero = True
+        if scope:
+            deadline = time.monotonic() + STOP_WAIT_SECONDS
+            while time.monotonic() < deadline and scope.active_process_count() > 0:
+                time.sleep(.1)
+            if scope.active_process_count() > 0:
+                scope.terminate()
+                zero = scope.wait_for_zero(STOP_CONFIRM_SECONDS)
+            scope.close()
+        with self.lock:
+            job = self.jobs.get(cid)
+            if not job or job['generation'] != generation:
+                return
+            job['scope'] = None
+            if zero:
+                job['lifecycle'] = 'stopped'
+                job['lastFailure'] = ''
+            else:
+                job['lifecycle'] = 'failed'
+                job['desiredRunning'] = False
+                job['lastFailure'] = '回收无法确认'
 
     def delete(self, cid):
         if not self.store.get(cid):
             raise ValueError('视频不存在')
         self.stop(cid)
-        self.store.delete(cid)
-        self.jobs.pop(cid, None)
+        with self.lock:
+            self.store.delete(cid)
+            self.jobs.pop(cid, None)
 
     def state(self):
-        cameras = []
-        for camera in self.store.cameras:
-            cid = camera['id']
-            running = self.running(cid)
-            run = self.run_dir(cid)
-            status = read_json(run/cid/'status.json', {}) if run else {}
-            state = status.get('state', 'starting') if running else 'stopped'
-            job = self.jobs.get(cid)
-            if job and job['process'].poll() not in (None, 0):
-                state = 'error'
-            latest = copy.deepcopy(status.get('latest', {}))
-            # 叠加层跟随当前配置：删除/解绑区域后，不再展示旧分析快照里的区域框。
-            zones = {z['id']: z for z in camera.get('regions', [])}
-            tasks = {t['eventId']: t for t in camera.get('tasks', [])}
-            live = ''
-            if run and status.get('live'):
-                live_path = (run / status['live']).resolve()
-                if live_path.is_file() and live_path.is_relative_to((self.work/'runtime').resolve()):
-                    stamp = int(live_path.stat().st_mtime_ns // 1_000_000)
-                    live = '/media/' + live_path.relative_to(self.work/'runtime').as_posix() + f'?v={stamp}'
-            for record in latest.values():
-                # 分析画面必须与该结果自己的 snapshot 一致；live.jpg 只保留为兼容字段。
-                record['image'] = '/media/' + (run/record['snapshot']).relative_to(self.work/'runtime').as_posix()
-                task = tasks.get(record.get('eventId'))
-                bound = set(task.get('regionIds', [])) if task else set()
-                record['regions'] = [copy.deepcopy(zones[zid]) for zid in bound
-                                    if zid in zones and zones[zid].get('enabled', True)]
-            cameras.append({**camera, 'running': running, 'state': state, 'latest': latest, 'liveImage': live,
-                            'modelErrors': status.get('modelErrors', {}), 'results': status.get('results', 0),
-                            'restarts': self.restarts.get(cid, 0),
-                            'alerts': status.get('alerts', {}),
-                            'resource': status.get('resource', {}),
-                            'preview': preview_for(camera)})
-        with closing(sqlite3.connect(self.database)) as db, db:
-            count = db.execute('SELECT COUNT(*) FROM alerts').fetchone()[0]
-            alerts = [json.loads(x[0]) for x in db.execute('SELECT record FROM alerts ORDER BY at DESC LIMIT 100')]
-        # 汇总各路上报状态，便于在界面上直接看出告警是否真的发出去了。
-        bridge = public_status()
-        detail = {'reported': 0, 'failed': 0, 'pending': 0}
-        for camera in cameras:
-            info = camera.get('alerts') or {}
-            for key in detail:
-                detail[key] += int(info.get(key) or 0)
-        bridge['detail'] = detail
-        # 汇总运行中任务的资源占用，为并发容量评估提供实测依据。
-        used = {'rssMb': 0.0, 'cpuPercent': 0.0}
-        for camera in cameras:
-            if not camera.get('running'):
-                continue
-            info = camera.get('resource') or {}
-            used['rssMb'] += float(info.get('rssMb') or 0)
-            used['cpuPercent'] += float(info.get('cpuPercent') or 0)
-        return {'cameras': cameras, 'models': model_status(), 'events': EVENTS,
-                'alerts': alerts, 'alertCount': count, 'alertBridge': bridge,
-                'capacity': {'maxRunning': MAX_RUNNING, 'running': self.running_count(),
-                             'watchdogSeconds': WATCHDOG_SECONDS,
-                             'rssMb': round(used['rssMb'], 1),
-                             'cpuPercent': round(used['cpuPercent'], 1)}}
+        with self.lock:
+            cameras = []
+            for camera in self.store.cameras:
+                cid = camera['id']
+                job = self.jobs.get(cid)
+                lifecycle = job['lifecycle'] if job else 'stopped'
+                running = lifecycle in LIFECYCLE_ADMITTED
+                run = self.run_dir(cid)
+                status = read_json(run/cid/'status.json', {}) if run else {}
+                if running:
+                    state = status.get('state', 'starting')
+                elif lifecycle == 'failed':
+                    state = 'error'
+                else:
+                    state = 'stopped'
+                latest = copy.deepcopy(status.get('latest', {}))
+                # 叠加层跟随当前配置：删除/解绑区域后，不再展示旧分析快照里的区域框。
+                zones = {z['id']: z for z in camera.get('regions', [])}
+                tasks = {t['eventId']: t for t in camera.get('tasks', [])}
+                live = ''
+                if run and status.get('live'):
+                    live_path = (run / status['live']).resolve()
+                    if live_path.is_file() and live_path.is_relative_to((self.work/'runtime').resolve()):
+                        stamp = int(live_path.stat().st_mtime_ns // 1_000_000)
+                        live = '/media/' + live_path.relative_to(self.work/'runtime').as_posix() + f'?v={stamp}'
+                for record in latest.values():
+                    # 分析画面必须与该结果自己的 snapshot 一致；live.jpg 只保留为兼容字段。
+                    record['image'] = '/media/' + (run/record['snapshot']).relative_to(self.work/'runtime').as_posix()
+                    task = tasks.get(record.get('eventId'))
+                    bound = set(task.get('regionIds', [])) if task else set()
+                    record['regions'] = [copy.deepcopy(zones[zid]) for zid in bound
+                                         if zid in zones and zones[zid].get('enabled', True)]
+                cameras.append({**camera, 'running': running, 'state': state,
+                                'lifecycle': lifecycle,
+                                'lastFailure': job['lastFailure'] if job else '',
+                                'nextRestartIn': (round(job['nextRestartMonotonic'] - time.monotonic(), 1)
+                                                  if job and job['nextRestartMonotonic'] else None),
+                                'restartCount': len(job['restartHistory']) if job else 0,
+                                'latest': latest, 'liveImage': live,
+                                'modelErrors': status.get('modelErrors', {}), 'results': status.get('results', 0),
+                                'alerts': status.get('alerts', {}),
+                                'resource': status.get('resource', {}),
+                                'preview': preview_for(camera)})
+            with closing(sqlite3.connect(self.database)) as db, db:
+                count = db.execute('SELECT COUNT(*) FROM alerts').fetchone()[0]
+                alerts = [json.loads(x[0]) for x in db.execute('SELECT record FROM alerts ORDER BY at DESC LIMIT 100')]
+            # 汇总各路上报状态，便于在界面上直接看出告警是否真的发出去了。
+            bridge = public_status()
+            detail = {'reported': 0, 'failed': 0, 'pending': 0}
+            for camera in cameras:
+                info = camera.get('alerts') or {}
+                for key in detail:
+                    detail[key] += int(info.get(key) or 0)
+            bridge['detail'] = detail
+            # 汇总运行中任务的资源占用，为并发容量评估提供实测依据。
+            used = {'rssMb': 0.0, 'cpuPercent': 0.0}
+            for camera in cameras:
+                if not camera.get('running'):
+                    continue
+                info = camera.get('resource') or {}
+                used['rssMb'] += float(info.get('rssMb') or 0)
+                used['cpuPercent'] += float(info.get('cpuPercent') or 0)
+            return {'cameras': cameras, 'models': model_status(), 'events': EVENTS,
+                    'alerts': alerts, 'alertCount': count, 'alertBridge': bridge,
+                    'capacity': {'maxRunning': MAX_RUNNING, 'running': self._admitted_locked(),
+                                 'watchdogSeconds': WATCHDOG_SECONDS,
+                                 'initialTimeoutSeconds': INITIAL_TIMEOUT_SECONDS,
+                                 'rssMb': round(used['rssMb'], 1),
+                                 'cpuPercent': round(used['cpuPercent'], 1)}}
 
     def alerts_csv(self):
         """把事件记录导出为 CSV 文本（字段与页面事件表一致）。"""
@@ -329,18 +545,25 @@ class Controller:
         return [{'name': p.stem, 'url': p.resolve().as_posix()} for p in sorted(media.glob('*.mp4'))]
 
     def close(self):
-        """关闭控制台：停止看门狗并结束本服务拥有的所有任务。
-
-        关闭路径不能因单路停止失败而中断，否则会留下仍在取流的孤儿进程。
-        """
+        """关闭控制台：先停看门狗并等待结束，再回收本服务拥有的全部作业。"""
         self.watchdog_stop.set()
+        if self.watchdog.is_alive():
+            self.watchdog.join(timeout=10)
         for cid in list(self.jobs):
             try:
                 self.stop(cid)
             except (ValueError, OSError):
-                self._terminate(self.jobs[cid]['process'])
+                job = self.jobs.get(cid)
+                scope = job.get('scope') if job else None
+                if scope:
+                    scope.terminate()
+                    scope.wait_for_zero(STOP_CONFIRM_SECONDS)
+                    scope.close()
             finally:
                 self.jobs.pop(cid, None)
+        if self._mutex:
+            self._mutex.close()
+            self._mutex = None
 
 
 def make_handler(controller, token):
@@ -497,7 +720,10 @@ if __name__ == '__main__':
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--data', type=Path, default=ROOT/'data')
     args = parser.parse_args()
-    controller = Controller(args.data)
+    try:
+        controller = Controller(args.data)
+    except (RuntimeError, OSError) as exc:
+        parser.exit(1, f'无法启动控制台：{exc}\n')
     server = ThreadingHTTPServer(('127.0.0.1', args.port), make_handler(controller, secrets.token_hex(24)))
     print(f'http://127.0.0.1:{args.port}', flush=True)
     try:

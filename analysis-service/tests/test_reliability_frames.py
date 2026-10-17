@@ -21,22 +21,6 @@ from console import Controller
 from service import Engine, validate_config
 
 
-class FakeProcess:
-    """Controller.state()/close() 只需要最小进程替身。"""
-
-    def poll(self):
-        return None
-
-    def wait(self, timeout=None):
-        return 0
-
-    def terminate(self):
-        pass
-
-    def kill(self):
-        pass
-
-
 def make_controller(work):
     Store(work).save({'id': 'cam1', 'name': '测试视频', 'url': 'rtsp://127.0.0.1/a',
                       'tasks': [{'eventId': 'brightness'}], 'regions': [],
@@ -74,7 +58,10 @@ class FrameConsistencyTests(unittest.TestCase):
                     'at': '2026-10-17T00:00:00+00:00',
                     'latest': {'brightness': record}, 'modelErrors': {}, 'alerts': {},
                     'resource': {}, 'live': 'cam1/live.jpg'}), encoding='utf-8')
-                controller.jobs['cam1'] = {'process': FakeProcess(), 'folder': run.parent}
+                job = controller._new_job(run.parent)
+                job['lifecycle'] = 'active'
+                job['desiredRunning'] = True
+                controller.jobs['cam1'] = job
 
                 camera = next(c for c in controller.state()['cameras'] if c['id'] == 'cam1')
                 image = camera['latest']['brightness']['image']
