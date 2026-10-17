@@ -274,29 +274,60 @@ class LatestStream:
             failures += 1
 
 
-def resource_usage():
-    """本进程的 CPU 与内存占用，用于评估并发容量。
+class ResourceSampler:
+    """分析进程资源采样：复用 psutil.Process 与 CPU 计数基线。
 
-    psutil 不可用时返回空字典，不影响分析主流程。
+    预热后按 1 秒间隔采样；状态文件可以更频繁发布，但复用最近一次完整样本。
+    首个有效间隔前或采样异常时 available=False、cpuPercent/rssMb 为 None，
+    不填充假零值。CPU 为进程口径：100% 约等于占满一个逻辑核。
     """
-    try:
-        import psutil
-    except ImportError:
-        return {}
-    try:
-        process = psutil.Process()
-        with process.oneshot():
-            return {
-                'cpuPercent': round(process.cpu_percent(interval=None), 1),
-                'rssMb': round(process.memory_info().rss / 1024 / 1024, 1),
-            }
-    except Exception:
-        return {}
+
+    REFRESH_SECONDS = 1.0
+    WARMUP_SECONDS = 1.0
+
+    def __init__(self):
+        self._process = None
+        self._warmup = time.monotonic()
+        self._last_sample = 0.0
+        self._last = self._unavailable()
+        try:
+            import psutil
+            self._process = psutil.Process()
+            self._process.cpu_percent(interval=None)  # 建立 CPU 时间基线
+        except Exception:
+            self._process = None
+
+    @staticmethod
+    def _unavailable():
+        return {'cpuPercent': None, 'rssMb': None, 'available': False, 'sampledAt': now()}
+
+    def sample(self):
+        current = time.monotonic()
+        if self._process is None:
+            self._last = self._unavailable()
+            return dict(self._last)
+        if self._last.get('available') and current - self._last_sample < self.REFRESH_SECONDS:
+            return dict(self._last)
+        if current - self._warmup < self.WARMUP_SECONDS:
+            self._last = self._unavailable()
+            return dict(self._last)
+        try:
+            with self._process.oneshot():
+                cpu = float(self._process.cpu_percent(interval=None))
+                rss = float(self._process.memory_info().rss) / 1024 / 1024
+        except Exception:
+            self._last = self._unavailable()
+            return dict(self._last)
+        self._last_sample = current
+        self._last = {'cpuPercent': round(cpu, 1), 'rssMb': round(rss, 1),
+                      'available': True, 'sampledAt': now()}
+        return dict(self._last)
 
 
 def camera_worker(camera, output, run_id, stop):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     engine = Engine(camera, Path(output), run_id)
+    sampler = ResourceSampler()
     reader = LatestStream(resolve_source(camera['url']), stop)
     reader.thread.start()
     state = None
@@ -315,7 +346,7 @@ def camera_worker(camera, output, run_id, stop):
                 engine.event(current)
                 state = current
             if time.monotonic() - heartbeat >= 0.1:
-                usage = resource_usage()
+                usage = sampler.sample()
                 # 心跳由实际工作循环推进，控制台据此区分“进程存活”和“推理卡死”。
                 heartbeat_seq += 1
                 atomic_json(engine.directory / 'status.json', {
@@ -335,7 +366,7 @@ def camera_worker(camera, output, run_id, stop):
         atomic_json(engine.directory / 'status.json', {
             'cameraId': camera['id'], 'state': 'stopped', 'results': engine.count, 'at': now(),
             'latest': engine.latest, 'modelErrors': engine.model_errors, 'alerts': engine.alerts.status(),
-            'resource': resource_usage()})
+            'resource': sampler.sample()})
 
 
 def run_service(config, output, duration=60):

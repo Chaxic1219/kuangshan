@@ -232,21 +232,55 @@ class CapacityTests(unittest.TestCase):
     def test_capacity_aggregates_running_resources(self):
         cid = self.add('运行中')['id']
         self.c.start(cid)
-        self.write_status(cid, heartbeat=1, resource={'rssMb': 333.7, 'cpuPercent': 120.0})
+        self.write_status(cid, heartbeat=1, resource={
+            'cpuPercent': 120.0, 'rssMb': 333.7, 'available': True,
+            'sampledAt': '2026-10-17T00:00:00+00:00'})
         state = self.c.state()
         self.assertAlmostEqual(state['capacity']['rssMb'], 333.7, places=1)
         self.assertAlmostEqual(state['capacity']['cpuPercent'], 120.0, places=1)
+        self.assertEqual(state['capacity']['sampledRunning'], 1)
+        self.assertEqual(state['capacity']['running'], 1)
         camera = next(c for c in state['cameras'] if c['id'] == cid)
         self.assertEqual(camera['resource']['rssMb'], 333.7)
+
+    def test_capacity_marks_partial_sampling(self):
+        sampled = self.add('有采样')['id']
+        unsampled = self.add('无采样')['id']
+        self.c.start(sampled)
+        self.c.start(unsampled)
+        self.write_status(sampled, heartbeat=1, resource={
+            'cpuPercent': 80.0, 'rssMb': 300.0, 'available': True,
+            'sampledAt': '2026-10-17T00:00:00+00:00'})
+        self.write_status(unsampled, heartbeat=1, resource={
+            'cpuPercent': None, 'rssMb': None, 'available': False,
+            'sampledAt': '2026-10-17T00:00:00+00:00'})
+        capacity = self.c.state()['capacity']
+        self.assertEqual(capacity['running'], 2)
+        self.assertEqual(capacity['sampledRunning'], 1)
+        self.assertAlmostEqual(capacity['cpuPercent'], 80.0, places=1)
+        self.assertAlmostEqual(capacity['rssMb'], 300.0, places=1)
+
+    def test_capacity_without_samples_returns_null(self):
+        cid = self.add('未采样')['id']
+        self.c.start(cid)
+        self.write_status(cid, heartbeat=1, resource={})
+        capacity = self.c.state()['capacity']
+        self.assertEqual(capacity['sampledRunning'], 0)
+        self.assertIsNone(capacity['cpuPercent'], '无有效样本时不得返回假零值')
+        self.assertIsNone(capacity['rssMb'])
 
     def test_stopped_camera_not_aggregated(self):
         cid = self.add('未运行')['id']
         self.c.start(cid)
-        self.write_status(cid, heartbeat=1, resource={'rssMb': 99.0, 'cpuPercent': 10.0})
+        self.write_status(cid, heartbeat=1, resource={
+            'cpuPercent': 99.0, 'rssMb': 99.0, 'available': True,
+            'sampledAt': '2026-10-17T00:00:00+00:00'})
         FakeScope.instances[-1].active = 0
         self.c.stop(cid)
-        state = self.c.state()
-        self.assertAlmostEqual(state['capacity']['rssMb'], 0.0, places=1)
+        capacity = self.c.state()['capacity']
+        self.assertEqual(capacity['running'], 0)
+        self.assertEqual(capacity['sampledRunning'], 0)
+        self.assertIsNone(capacity['rssMb'], '无运行样本时不返回假零值')
 
 
 if __name__ == '__main__':

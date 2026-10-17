@@ -489,21 +489,26 @@ class Controller:
                 for key in detail:
                     detail[key] += int(info.get(key) or 0)
             bridge['detail'] = detail
-            # 汇总运行中任务的资源占用，为并发容量评估提供实测依据。
+            # 只聚合有效资源样本；无样本时返回 null，不用假零值冒充真实占用。
             used = {'rssMb': 0.0, 'cpuPercent': 0.0}
+            sample_count = 0
             for camera in cameras:
                 if not camera.get('running'):
                     continue
                 info = camera.get('resource') or {}
-                used['rssMb'] += float(info.get('rssMb') or 0)
-                used['cpuPercent'] += float(info.get('cpuPercent') or 0)
+                if info.get('available') and info.get('cpuPercent') is not None:
+                    used['cpuPercent'] += float(info['cpuPercent'])
+                    used['rssMb'] += float(info.get('rssMb') or 0)
+                    sample_count += 1
             return {'cameras': cameras, 'models': model_status(), 'events': EVENTS,
                     'alerts': alerts, 'alertCount': count, 'alertBridge': bridge,
                     'capacity': {'maxRunning': MAX_RUNNING, 'running': self._admitted_locked(),
+                                 'sampledRunning': sample_count,
                                  'watchdogSeconds': WATCHDOG_SECONDS,
                                  'initialTimeoutSeconds': INITIAL_TIMEOUT_SECONDS,
-                                 'rssMb': round(used['rssMb'], 1),
-                                 'cpuPercent': round(used['cpuPercent'], 1)}}
+                                 'cpuScope': 'process',
+                                 'rssMb': round(used['rssMb'], 1) if sample_count else None,
+                                 'cpuPercent': round(used['cpuPercent'], 1) if sample_count else None}}
 
     def alerts_csv(self):
         """把事件记录导出为 CSV 文本（字段与页面事件表一致）。"""
