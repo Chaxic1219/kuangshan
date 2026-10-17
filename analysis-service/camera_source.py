@@ -292,6 +292,10 @@ def ensure_live_config(config_path=None):
         head = LIVE_HEADER + template[index + 1:]
     else:
         head = LIVE_HEADER + template
+    # live 模式关闭 HLS：本机摄像头面板不需要浏览器预览，且 8888 端口常被其他程序占用。
+    head = re.sub(r'(?m)^hls:\s*yes\s*$',
+                  '# live 模式关闭 HLS（本机摄像头面板不需要；8888 常被其他程序占用）\nhls: no',
+                  head, count=1)
     paths_index = head.find('\npaths:')
     body = (head[:paths_index] + '\npaths:\n') if paths_index >= 0 else (head.rstrip('\n') + '\npaths:\n')
     atomic_text(config_path, body + '\n' + LIVE_PATH_MARK + '\n' + LIVE_END_MARK + '\n')

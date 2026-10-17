@@ -237,6 +237,8 @@ class ConfigUpsertTests(unittest.TestCase):
             text = config.read_text(encoding='utf-8')
             self.assertIn('rtspAddress:', text, '沿用 lite 的监听设置')
             self.assertIn('paths:', text)
+            self.assertIn('hls: no', text, 'live 模式关闭 HLS，避开 8888 端口冲突')
+            self.assertNotIn('hls: yes', text)
             self.assertIn(LIVE_PATH_MARK, text)
             self.assertIn(LIVE_END_MARK, text)
             self.assertNotIn('videos/camera1.mp4', text, 'live 配置不得包含模拟流')

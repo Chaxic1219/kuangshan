@@ -16,7 +16,8 @@ rtspAddress: :8554
 # 浏览器预览：WebRTC（前端低延迟播放）+ HLS（备用）
 webrtc: yes
 webrtcAddress: :8889
-hls: yes
+# live 模式关闭 HLS（本机摄像头面板不需要；8888 常被其他程序占用）
+hls: no
 hlsAddress: :8888
 hlsAllowOrigin: "*"
 
