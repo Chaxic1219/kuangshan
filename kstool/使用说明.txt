@@ -1,0 +1,82 @@
+﻿矿山模拟摄像头流服务（MediaMTX + FFmpeg）—— 使用说明
+================================================================
+
+【零、最快的用法】
+
+解压后，在本文件夹（不用进 mediamtx 子文件夹）直接双击：
+
+    启动-完整18路.bat       —— 18 路摄像头（演示 / 答辩用）
+    启动-精简8路.bat        —— 8 路摄像头（低配电脑 / 省 CPU）
+    停止.bat                —— 停止服务
+
+出现"启动成功"就好了，浏览器会自动打开预览画面。
+想看更详细的配置说明，进 mediamtx 文件夹看 README.md。
+
+【一、正常三步】
+
+1. 解压到任意位置（桌面、D 盘、中文目录、带空格的目录都可以）
+   注意：解压后的 mediamtx 文件夹里的内容要保持相对位置，不要拆散。
+
+2. 双击上面的启动脚本。首次运行若弹出 Windows 防火墙，请点"允许访问"。
+
+3. 出现"启动成功"即完成。停止时双击"停止.bat"。
+
+   说明：真正的脚本在 mediamtx 目录里（start_streams.bat /
+   start_streams_lite.bat / stop_streams.bat），根目录这几个只是
+   为了方便不用进文件夹的快捷入口，功能完全一样。
+
+【二、流地址】
+
+   本机：   rtsp://127.0.0.1:8554/camera1   ~ camera18
+   局域网： rtsp://<本机IP>:8554/camera1     ~ camera18
+            （本机IP 启动脚本会自动打印；也可 ipconfig 查看）
+
+   浏览器预览：  http://127.0.0.1:8889/camera1
+   在线流列表：  http://127.0.0.1:9997/v3/paths/list
+
+   VLC / PotPlayer 直接打开上面的 rtsp 地址就能看到画面。
+
+【三、常见问题】
+
+Q：双击没反应，或弹出"Windows 已保护你的电脑"？
+A：文件是从别的电脑传过来的，被系统标记为"来自网络"而锁定了。
+   先双击运行"如果被系统拦截-点我解除锁定.bat"，再启动即可。
+
+Q：提示"找不到 mediamtx 文件夹"？
+A：本入口脚本必须和 mediamtx 文件夹在同一层。别把它单独拷出来。
+
+Q：提示"端口 8554 已被占用"？
+A：流服务已经在跑了，不用重复启动。要重启就先双击"停止.bat"。
+
+Q：等了 25 秒提示超时？
+A：看同时弹出的黑色 MediaMTX 窗口里的红色报错。最常见是被杀毒软件
+   或防火墙拦截，放行 mediamtx.exe 和 ffmpeg.exe 即可。
+
+Q：局域网其他电脑拉不到流？
+A：确认防火墙已放行，且对方用的是你的局域网 IP 而不是 127.0.0.1。
+
+Q：电脑配置一般，跑 18 路很卡？
+A：改用"启动-精简8路.bat"，只推 camera1~camera8。
+
+Q：提示"缺少 api-ms-win-crt-xxx.dll" / ffmpeg 一闪而过？
+A：只会出现在 Windows 7 / 8 这类老系统上（缺 Universal CRT）。
+   到微软官网下载安装 VC_redist.x64.exe（Visual C++ 2015-2022 运行库）
+   后重启电脑即可。Windows 10 / 11 系统自带，不会遇到这个问题。
+   （mediamtx.exe 不依赖任何运行库，只有 ffmpeg 有这个要求）
+
+Q：不想自动弹浏览器？
+A：用记事本打开 mediamtx\start_streams.bat，把 AUTO_OPEN 改成 0。
+
+【四、目录里都有什么】
+
+   使用说明.txt                 本文件
+   启动-完整18路.bat            快捷入口（18 路）
+   启动-精简8路.bat             快捷入口（8 路）
+   停止.bat                     快捷入口（停止）
+   如果被系统拦截-点我解除锁定.bat   解除下载文件锁定
+   mediamtx\bin\mediamtx.exe        流媒体服务器
+   mediamtx\bin\ffmpeg_bin\         FFmpeg（把本地视频循环推成 RTSP 流）
+   mediamtx\videos\camera1~18.mp4   18 路模拟摄像头视频源
+   mediamtx\mediamtx.yml             完整配置（18 路）
+   mediamtx\mediamtx-lite.yml        精简配置（8 路）
+   mediamtx\README.md                进阶说明（改点位、接真实摄像头等）

@@ -1,0 +1,11 @@
+# 版本基线：跟踪源码、配置、文档与演示视频；运行环境与生成物不入库。
+
+# Python 虚拟环境与缓存
+analysis-service/.venv/
+**/__pycache__/
+*.pyc
+
+# 第三方推流工具二进制与证书私钥不入库（视频素材与配置入库）
+kstool/mediamtx/bin/
+kstool/mediamtx/runtime/
+kstool/mediamtx/auto.key

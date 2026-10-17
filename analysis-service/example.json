@@ -1,0 +1,17 @@
+{
+  "cameras": [
+    {
+      "id": "demo-a",
+      "name": "演示视频 A",
+      "location": "演示区",
+      "url": "REPLACE_WITH_LOCAL_MP4_OR_RTSP",
+      "tasks": [
+        {"eventId": "person", "confidence": 0.4, "interval": 1, "cooldown": 30, "enabled": true, "regionIds": []},
+        {"eventId": "intrusion", "confidence": 0.4, "interval": 1, "cooldown": 10, "enabled": true, "regionIds": ["zone1"]}
+      ],
+      "regions": [
+        {"id": "zone1", "name": "禁区", "enabled": true, "points": [[0.2, 0.2], [0.8, 0.2], [0.8, 0.8], [0.2, 0.8]]}
+      ]
+    }
+  ]
+}

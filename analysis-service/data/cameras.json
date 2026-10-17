@@ -1,0 +1,46 @@
+[
+  {
+    "id": "4d2a94e970c3",
+    "name": "camera6",
+    "url": "kstool/mediamtx/videos/camera12.mp4",
+    "location": "井上",
+    "tasks": [
+      {
+        "eventId": "person",
+        "confidence": 0.4,
+        "interval": 0,
+        "cooldown": 30,
+        "enabled": true,
+        "regionIds": [],
+        "dark": 0.12,
+        "bright": 0.88,
+        "model": "general",
+        "id": "person"
+      }
+    ],
+    "regions": [],
+    "cover": "/covers/13b89cada5ec4689a62289c3967ec78f.jpg"
+  },
+  {
+    "id": "9e131381289e",
+    "name": "camera15",
+    "url": "kstool/mediamtx/videos/camera15.mp4",
+    "location": "",
+    "tasks": [
+      {
+        "eventId": "person",
+        "confidence": 0.4,
+        "interval": 0,
+        "cooldown": 30,
+        "enabled": true,
+        "regionIds": [],
+        "dark": 0.12,
+        "bright": 0.88,
+        "model": "general",
+        "id": "person"
+      }
+    ],
+    "regions": [],
+    "cover": "/covers/be68da6f63fa4fbfb17673c243254dc9.jpg"
+  }
+]

@@ -1,0 +1,10 @@
+stream-infer==0.6.7
+av>=12.0.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+ultralytics==8.3.221
+torch==2.6.0
+torchvision==0.21.0
+lap>=0.5.12
+dill>=0.3.8
+psutil>=5.9.0

@@ -1,0 +1,105 @@
+# ============================================================
+# 精简版配置（lite）：只推 camera1 ~ camera8 共 8 路
+# 适用：低配电脑 / 只需要看主要点位 / 想降低 CPU 占用
+# 启动：双击 start_streams_lite.bat（或手工执行）
+#         bin\mediamtx.exe mediamtx-lite.yml
+# 完整 18 路请用 mediamtx.yml + start_streams.bat
+# ============================================================
+# ============================================================
+# 矿区摄像头 RTSP 模拟配置（MediaMTX v1.21.0）· 18 路（16 主 + 2 备）
+# 视频源：videos/cameraN.mp4 —— 由 Desktop/矿山视频/模拟RTSP/ 原片转码生成
+# 转码参数：H.264 Main Profile、无 B 帧（-bf 0）、去音轨 —— WebRTC/WHEP 兼容
+# 原因：WebRTC 不支持带 B 帧的 H.264，直接推原片会被 MediaMTX 周期性掐断会话
+#
+# 启动命令（在本目录执行）：
+#   bin\mediamtx.exe mediamtx.yml
+#
+# 生成的 RTSP 地址：
+#   主力：rtsp://127.0.0.1:8554/camera1 ~ camera16（接入监控页/数据库）
+#   备用：rtsp://127.0.0.1:8554/camera17 ~ camera18（临时顶替/扩展用）
+#
+# 落地阶段：把某一路的 runOnInit 段替换为真实摄像头静态源即可
+#   cameraX:
+#     source: rtsp://10.x.x.x:554/Streaming/Channels/101
+# ============================================================
+
+logLevel: info
+
+# 管理API（http://127.0.0.1:9997/v3/paths/list 查看在线流）
+api: yes
+apiAddress: 127.0.0.1:9997
+
+# RTSP 服务（模拟摄像头输出）
+rtsp: yes
+rtspAddress: :8554
+
+# 浏览器预览：WebRTC（前端低延迟播放）+ HLS（备用）
+webrtc: yes
+webrtcAddress: :8889
+hls: yes
+hlsAddress: :8888
+hlsAllowOrigin: "*"
+
+# 关闭不需要的协议
+rtmp: no
+srt: no
+
+paths:
+  # ========== 采掘 · 综采工作面（4 路） ==========
+  camera1:
+    runOnInit: >-
+      "bin/ffmpeg_bin/ffmpeg.exe" -re -stream_loop -1 -i
+      "videos/camera1.mp4"
+      -c copy -f rtsp rtsp://localhost:8554/camera1
+    runOnInitRestart: yes
+
+  camera2:
+    runOnInit: >-
+      "bin/ffmpeg_bin/ffmpeg.exe" -re -stream_loop -1 -i
+      "videos/camera2.mp4"
+      -c copy -f rtsp rtsp://localhost:8554/camera2
+    runOnInitRestart: yes
+
+  camera3:
+    runOnInit: >-
+      "bin/ffmpeg_bin/ffmpeg.exe" -re -stream_loop -1 -i
+      "videos/camera3.mp4"
+      -c copy -f rtsp rtsp://localhost:8554/camera3
+    runOnInitRestart: yes
+
+  camera4:
+    runOnInit: >-
+      "bin/ffmpeg_bin/ffmpeg.exe" -re -stream_loop -1 -i
+      "videos/camera4.mp4"
+      -c copy -f rtsp rtsp://localhost:8554/camera4
+    runOnInitRestart: yes
+
+  # ========== 采掘 · 掘进工作面（含 1 路风险演示） ==========
+  camera5:
+    runOnInit: >-
+      "bin/ffmpeg_bin/ffmpeg.exe" -re -stream_loop -1 -i
+      "videos/camera5.mp4"
+      -c copy -f rtsp rtsp://localhost:8554/camera5
+    runOnInitRestart: yes
+
+  camera6:
+    # 风险视频：用于 AI 告警演示（对应数据库 掘进工作面B区）
+    runOnInit: >-
+      "bin/ffmpeg_bin/ffmpeg.exe" -re -stream_loop -1 -i
+      "videos/camera6.mp4"
+      -c copy -f rtsp rtsp://localhost:8554/camera6
+    runOnInitRestart: yes
+
+  camera7:
+    runOnInit: >-
+      "bin/ffmpeg_bin/ffmpeg.exe" -re -stream_loop -1 -i
+      "videos/camera7.mp4"
+      -c copy -f rtsp rtsp://localhost:8554/camera7
+    runOnInitRestart: yes
+
+  camera8:
+    runOnInit: >-
+      "bin/ffmpeg_bin/ffmpeg.exe" -re -stream_loop -1 -i
+      "videos/camera8.mp4"
+      -c copy -f rtsp rtsp://localhost:8554/camera8
+    runOnInitRestart: yes
