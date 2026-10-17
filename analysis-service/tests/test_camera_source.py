@@ -1,12 +1,14 @@
 """摄像头映射：dshow 设备枚举与 MediaMTX 配置生成（不启动进程的部分）。"""
 import tempfile
+import io
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import camera_source
 
 from camera_source import (build_push_command, ensure_live_config, list_camera_devices,
                            managed_paths, remove_live_path, upsert_live_path,
-                           LIVE_END_MARK, LIVE_PATH_MARK)
+                           LIVE_END_MARK, LIVE_PATH_MARK, write_live_config)
 
 
 class FakeFFprobeExit:
@@ -38,6 +40,7 @@ class CommandTests(unittest.TestCase):
         """不指定分辨率时跟随设备原生格式（UVC 摄像头支持的分辨率并不统一）。"""
         command = build_push_command('USB2.0 PC CAMERA', 'livecam_usb1')
         self.assertNotIn('-video_size', command)
+        self.assertNotIn('-framerate', command)
 
     def test_push_command_quotes_device_name(self):
         command = build_push_command('Logi C920 (HD)', 'cam')
@@ -75,8 +78,67 @@ class DeviceListTests(unittest.TestCase):
         self.assertEqual(devices, [])
         self.assertTrue(error)
 
+    def test_same_name_devices_keep_distinct_identifiers(self):
+        devices = self.run_parse(
+            '[dshow @ x] "USB Camera" (video)\n'
+            '[dshow @ x]   Alternative name "@device_pnp_first"\n'
+            '[dshow @ x] "USB Camera" (video)\n'
+            '[dshow @ x]   Alternative name "@device_pnp_second"\n')
+        self.assertEqual([d.get('id') for d in devices],
+                         ['@device_pnp_first', '@device_pnp_second'])
+
+    def test_ambiguous_devices_are_not_selectable(self):
+        devices = self.run_parse('[dshow @ x] "USB" (video)\n[dshow @ x] "USB" (video)\n')
+        self.assertTrue(all(not d['usable'] for d in devices))
+
 
 class ConfigUpsertTests(unittest.TestCase):
+    def test_batch_collision_does_not_write_first_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp)/'m.yml'
+            before = 'paths:\n  manual:\n    source: publisher\n'
+            config.write_text(before, encoding='utf-8')
+            with self.assertRaises(ValueError):
+                write_live_config(config, {'livecam1': 'Camera A', 'manual': 'Camera B'})
+            self.assertEqual(config.read_text(encoding='utf-8'), before)
+
+    def test_ready_check_uses_api_port_and_requires_ready_true(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp)/'m.yml'
+            config.write_text('api: yes\napiAddress: "127.0.0.1:20001"\npaths:\n', encoding='utf-8')
+            with patch.object(camera_source, 'LIVE_CONFIG', config), \
+                    patch.object(camera_source, 'urlopen', return_value=io.BytesIO(b'{"ready":true}')) as request:
+                self.assertTrue(camera_source.wait_live_ready('livecam1', timeout=.05))
+                self.assertEqual(request.call_args.args[0], 'http://127.0.0.1:20001/v3/paths/get/livecam1')
+            with patch.object(camera_source, 'LIVE_CONFIG', config), \
+                    patch.object(camera_source, 'urlopen', side_effect=lambda *a, **kw: io.BytesIO(b'{"ready":false}')):
+                self.assertFalse(camera_source.wait_live_ready('livecam1', timeout=.01))
+    def test_manual_collision_is_rejected_without_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp)/'m.yml'
+            before = 'paths:\n  livecam1:\n    source: publisher\n'
+            config.write_text(before, encoding='utf-8')
+            with self.assertRaises(ValueError):
+                upsert_live_path(config, 'livecam1', 'Camera A')
+            self.assertEqual(config.read_text(encoding='utf-8'), before)
+
+    def test_incomplete_markers_reject_without_losing_manual_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp)/'m.yml'
+            before = 'paths:\n' + LIVE_PATH_MARK + '\n  manual:\n    source: publisher\n'
+            config.write_text(before, encoding='utf-8')
+            with self.assertRaises(ValueError):
+                upsert_live_path(config, 'livecam1', 'Camera A')
+            self.assertEqual(config.read_text(encoding='utf-8'), before)
+
+    def test_managed_paths_insert_under_paths_before_other_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp)/'m.yml'
+            config.write_text('paths:\n  manual:\n    source: publisher\nlogLevel: info\n', encoding='utf-8')
+            upsert_live_path(config, 'livecam1', 'Camera A')
+            text = config.read_text(encoding='utf-8')
+            self.assertLess(text.index(LIVE_END_MARK), text.index('logLevel:'))
+
     def write_base(self, folder):
         config = folder/'mediamtx-live.yml'
         config.write_text(

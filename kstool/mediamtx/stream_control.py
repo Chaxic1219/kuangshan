@@ -103,7 +103,7 @@ def rtsp_port(mode, override=None):
     match = re.search(r'^\s*rtspAddress:\s*(\S+)', text, re.M)
     if not match:
         return 8554
-    address = match.group(1)
+    address = match.group(1).strip('\"\'')
     try:
         return int(address.rsplit(':', 1)[1])
     except (IndexError, ValueError):
@@ -126,7 +126,7 @@ def udp_taken(port):
 
 
 def parse_port(value):
-    match = re.search(r':(\d+)\s*$', value.strip())
+    match = re.search(r':(\d+)\s*$', value.strip().strip('\"\''))
     return int(match.group(1)) if match else 0
 
 
@@ -374,11 +374,14 @@ def command_start(mode, config_path=None):
     return 1
 
 
-def command_stop(force=False):
+def command_stop(force=False, expected_mode=None):
     session = read_session()
     if not session:
         print('当前项目没有运行中的模拟流。')
         return 0
+    if expected_mode and session.get('mode') != expected_mode:
+        print('拒绝停止：当前会话模式与请求不符，未终止任何进程。')
+        return 4
     problem = identity_problem(session)
     if problem is not None:
         print(f'拒绝停止：{problem}。未终止任何进程，请人工检查运行记录。')
@@ -430,6 +433,7 @@ def main(argv=None):
     run.add_argument('--config', help='内部使用：与 start 相同的配置覆盖')
     stop = sub.add_parser('stop', help='停止模拟流')
     stop.add_argument('--force', action='store_true', help='身份校验通过后强制终止无响应的管理进程')
+    stop.add_argument('--expected-mode', choices=('full', 'lite', 'live'), help='仅停止指定模式的会话')
     sub.add_parser('status', help='查看当前实例')
     args = parser.parse_args(argv)
 
@@ -440,7 +444,7 @@ def main(argv=None):
             run_manager(args.mode, args.config)
             return 0
         if args.command == 'stop':
-            return command_stop(args.force)
+            return command_stop(args.force, args.expected_mode)
         if args.command == 'status':
             return command_status()
         parser.print_help()

@@ -84,9 +84,9 @@ class LiveCameraApiTests(unittest.TestCase):
         self.assertIn(camera_source.LIVE_PATH_MARK, text)
         self.assertIn('livecam1:', text)
         self.assertIn('video="USB Camera A"', text)
-        # 第二轮映射自动取下一个编号
+        # 重复接入复用原映射，不重复占用同一个物理设备。
         status, second = self.request('POST', '/api/cameras/live', {'device': 'USB Camera A'})
-        self.assertEqual(second['path'], 'livecam2')
+        self.assertEqual(second['path'], 'livecam1')
 
     def test_reject_unusable_or_unknown_device(self):
         for device in ('Virtual B', 'Not Exist', ''):
@@ -133,6 +133,18 @@ class LiveCameraApiTests(unittest.TestCase):
         status, _ = self.request('POST', '/api/cameras/live',
                                  {'device': 'USB Camera A'}, token='')
         self.assertEqual(status, 403)
+        status, _ = self.request('POST', '/api/cameras/live/batch',
+                                 {'selections': [], 'start': False}, token='')
+        self.assertEqual(status, 403)
+
+    def test_batch_api_saves_without_opening_device(self):
+        status, data = self.request('POST', '/api/cameras/live/batch',
+                                    {'selections': [{'deviceId': 'USB Camera A', 'model': 'opencv',
+                                                     'events': ['brightness']}], 'start': False})
+        self.assertEqual(status, 200)
+        self.assertTrue(data['ok'])
+        self.assertEqual(data['results'][0]['status'], 'saved')
+        self.assertEqual(len(self.controller.store.cameras), 1)
 
 
 if __name__ == '__main__':

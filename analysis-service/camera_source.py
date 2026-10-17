@@ -8,7 +8,16 @@
 - 设备枚举失败（无 ffmpeg / 无权限 / 无设备）返回明确错误，不静默降级。
 """
 import re
+import json
 import subprocess
+import sys
+import tempfile
+import threading
+import time
+from urllib.request import urlopen
+from urllib.error import URLError
+from urllib.parse import quote
+from functools import wraps
 from pathlib import Path
 
 KSTOOL = Path(__file__).resolve().parent.parent / 'kstool' / 'mediamtx'
@@ -20,13 +29,42 @@ LIVE_END_MARK = '# ---- live cameras end ----'
 PATH_NAME = re.compile(r'^[a-z0-9][a-z0-9_-]{0,63}$')
 DEVICE_NAME = re.compile(r'^\[[^\]]+\]\s+"([^"]+)"\s+\((video|none)\)\s*$')
 COMMAND_DEVICE = re.compile(r'-i\s+video="([^"]+)"')
+CONFIG_LOCK = threading.RLock()
+
+
+def serialized(function):
+    @wraps(function)
+    def call(*args, **kwargs):
+        with CONFIG_LOCK:
+            return function(*args, **kwargs)
+    return call
+
+
+def atomic_text(path, text):
+    """同目录临时文件替换，MediaMTX 不会读到写了一半的配置。"""
+    if path.exists() and path.read_text(encoding='utf-8') == text:
+        return
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                                     prefix='_run_live_', suffix='.tmp', delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            output.write(text)
+        except BaseException:
+            output.close()
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def run_ffmpeg(arguments):
     """运行项目自带 ffmpeg；返回 CompletedProcess（stdout/stderr 为文本）。"""
     return subprocess.run(
         [str(FFMPEG), '-hide_banner', *arguments],
-        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15)
+        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
 
 
 def list_camera_devices(with_error=False):
@@ -42,46 +80,82 @@ def list_camera_devices(with_error=False):
         error = '无法运行 ffmpeg 枚举设备：%s' % exc
         return ([], error) if with_error else []
     devices = []
+    current = None
     for line in text.splitlines():
         match = DEVICE_NAME.match(line.strip())
         if not match:
+            alternate = re.search(r'Alternative name "([^"]+)"', line)
+            if alternate and current is not None:
+                current['id'] = alternate.group(1)
+            elif re.search(r'"[^\"]+" \(audio\)', line):
+                current = None
             continue
         name, kind = match.group(1), match.group(2)
-        devices.append({'name': name, 'usable': kind == 'video'})
+        current = {'id': name, 'name': name, 'usable': kind == 'video'}
+        devices.append(current)
+    for device in devices:
+        if sum(d['id'] == device['id'] for d in devices) > 1:
+            device['usable'] = False
+            device['error'] = '设备重名且没有唯一标识，无法安全选择'
     if not devices:
         error = '未检测到摄像头设备（或 ffmpeg 无法枚举）'
         return ([], error) if with_error else []
     return (devices, '') if with_error else devices
 
 
-def build_push_command(device, path_name, framerate=25, size=None, bitrate='1200k',
+def build_push_command(device, path_name, framerate=None, size=None, bitrate='1200k',
                        rtsp_port=8554):
     """生成 dshow 采集转码推 RTSP 的 ffmpeg 命令（单行，供 runOnInit 使用）。
 
     size 默认 None：不同摄像头支持的分辨率不同，写死会导致 "Could not set video options"。
     需要指定时传如 '1280x720'，并确认设备支持该格式。
     """
-    if not isinstance(device, str) or not device.strip() or '"' in device or '\n' in device:
+    if not isinstance(device, str) or not device.strip() or any(c in device for c in ('"', '\n', '\r', '\0')):
         raise ValueError('摄像头设备名不合法')
-    if not PATH_NAME.match(path_name or ''):
+    if not PATH_NAME.fullmatch(path_name or ''):
         raise ValueError('路径名须为小写字母/数字开头，可含 - 和 _，长度 1～64')
     size_arg = f'-video_size {size} ' if size else ''
+    rate_arg = f'-framerate {int(framerate)} ' if framerate is not None else ''
     return (
-        f'"bin/ffmpeg_bin/ffmpeg.exe" -f dshow -framerate {int(framerate)} '
+        f'"bin/ffmpeg_bin/ffmpeg.exe" -f dshow {rate_arg}'
         f'-rtbufsize 100M {size_arg}-i video="{device.strip()}" '
         f'-c:v libx264 -preset ultrafast -tune zerolatency -b:v {bitrate} '
         f'-pix_fmt yuv420p -bf 0 -an -f rtsp rtsp://127.0.0.1:{int(rtsp_port)}/{path_name}')
 
 
-def config_rtsp_port(text):
+def config_rtsp_port(text, key='rtspAddress', default=8554):
     """从配置文本解析 RTSP 端口；解析失败回退 8554。"""
-    match = re.search(r'^\s*rtspAddress:\s*(\S+)', text or '', re.M)
+    match = re.search(r'^\s*%s:\s*(\S+)' % re.escape(key), text or '', re.M)
     if not match:
-        return 8554
+        return default
     try:
-        return int(match.group(1).rsplit(':', 1)[1])
+        port = int(match.group(1).strip('\"\'').rsplit(':', 1)[1])
+        if not 1 <= port <= 65535:
+            raise ValueError('端口超出范围')
+        return port
     except (IndexError, ValueError):
-        return 8554
+        return default
+
+
+def wait_live_ready(path_name, timeout=12):
+    """先等该路径收到发布流，再让调用方读取真实首帧；不以监听端口代替就绪。"""
+    text = live_config_path().read_text(encoding='utf-8')
+    if not re.search(r'(?m)^api:\s*(yes|true)\s*(?:#.*)?$', text):
+        # 手写配置关闭管理接口时，由随后的真实截帧负责判断。
+        return True
+    port = config_rtsp_port(text, 'apiAddress', 9997)
+    url = 'http://127.0.0.1:%d/v3/paths/get/%s' % (port, quote(path_name, safe=''))
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with urlopen(url, timeout=min(1, max(.01, deadline-time.monotonic()))) as response:
+                result = json.loads(response.read(65536))
+            if isinstance(result, dict) and result.get('ready') is True:
+                return True
+        except (URLError, OSError, ValueError):
+            pass
+        time.sleep(min(.25, max(0, deadline-time.monotonic())))
+    return False
 
 
 def _path_block(path_name, device, port):
@@ -95,10 +169,19 @@ def _split_region(text):
     """拆分为 (标记前, 受管段内, 标记后)；无受管段时中间为空。"""
     begin = text.find(LIVE_PATH_MARK)
     if begin < 0:
-        return text, '', ''
+        if LIVE_END_MARK in text:
+            raise ValueError('摄像头配置受管段标记不完整，请先修复配置')
+        paths = re.search(r'(?m)^paths:\s*$', text)
+        if not paths:
+            if re.search(r'(?m)^paths:', text):
+                raise ValueError('paths 必须使用多行配置')
+            return text.rstrip('\n') + '\npaths:\n', '', ''
+        following = re.search(r'(?m)^[A-Za-z][\w]*:', text[paths.end():])
+        split = paths.end() + following.start() if following else len(text)
+        return text[:split], '', text[split:]
     end = text.find(LIVE_END_MARK, begin)
-    if end < 0:
-        return text[:begin], text[begin + len(LIVE_PATH_MARK):], ''
+    if end < 0 or text.count(LIVE_PATH_MARK) != 1 or text.count(LIVE_END_MARK) != 1:
+        raise ValueError('摄像头配置受管段标记不完整，请先修复配置')
     return text[:begin], text[begin + len(LIVE_PATH_MARK):end], text[end + len(LIVE_END_MARK):]
 
 
@@ -126,15 +209,32 @@ def _render_region(mapping, port):
     return '\n'.join(lines) + '\n'
 
 
+def all_path_names(config_path):
+    text = Path(config_path).read_text(encoding='utf-8') if Path(config_path).exists() else ''
+    return set(re.findall(r'(?m)^  [\"\']?([a-z0-9][a-z0-9_-]{0,63})[\"\']?:', text))
+
+
+@serialized
 def upsert_live_path(config_path, path_name, device):
     """把设备写入受管段；返回 True 表示新增，False 表示替换已有 path。"""
-    build_push_command(device, path_name)  # 先校验参数
+    added = path_name not in managed_paths(config_path)
+    write_live_config(config_path, {path_name: device})
+    return added
+
+
+@serialized
+def write_live_config(config_path, updates):
+    """整批校验后一次替换，避免部分保存或多次配置热重载。"""
     config_path = Path(config_path)
     text = config_path.read_text(encoding='utf-8') if config_path.is_file() else 'paths:\n'
     port = config_rtsp_port(text)
     mapping = managed_paths(config_path)
-    added = path_name not in mapping
-    mapping[path_name] = device.strip()
+    manual_names = all_path_names(config_path) - mapping.keys()
+    for path_name, device in updates.items():
+        build_push_command(device, path_name)
+        if path_name in manual_names:
+            raise ValueError('路径名与手写配置重复，请选择其他名称')
+        mapping[path_name] = device.strip()
     head, _, tail = _split_region(text)
     # 受管段紧跟 paths: 之后；若原文件没有 paths: 则补上。
     if 'paths:' not in head:
@@ -145,10 +245,11 @@ def upsert_live_path(config_path, path_name, device):
         body = head.rstrip('\n') + '\n' + _render_region(mapping, port)
     if not body.endswith('\n'):
         body += '\n'
-    config_path.write_text(body, encoding='utf-8')
-    return added
+    atomic_text(config_path, body)
+    return mapping
 
 
+@serialized
 def remove_live_path(config_path, path_name):
     """从受管段移除一个 path；返回是否命中。"""
     config_path = Path(config_path)
@@ -164,15 +265,8 @@ def remove_live_path(config_path, path_name):
         body = body + '\n' + tail.lstrip('\n')
     if not body.endswith('\n'):
         body += '\n'
-    config_path.write_text(body, encoding='utf-8')
+    atomic_text(config_path, body)
     return True
-
-
-def write_live_config(config_path, mapping):
-    """一次性写入多路映射（供界面批量保存）。"""
-    for path_name, device in mapping.items():
-        upsert_live_path(config_path, path_name, device)
-    return managed_paths(config_path)
 
 
 LIVE_HEADER = (
@@ -183,6 +277,7 @@ LIVE_HEADER = (
     '# ============================================================\n')
 
 
+@serialized
 def ensure_live_config(config_path=None):
     """确保 live 配置存在：沿用 lite 的监听设置，只保留受管摄像头段。
 
@@ -199,8 +294,7 @@ def ensure_live_config(config_path=None):
         head = LIVE_HEADER + template
     paths_index = head.find('\npaths:')
     body = (head[:paths_index] + '\npaths:\n') if paths_index >= 0 else (head.rstrip('\n') + '\npaths:\n')
-    config_path.write_text(
-        body + '\n' + LIVE_PATH_MARK + '\n' + LIVE_END_MARK + '\n', encoding='utf-8')
+    atomic_text(config_path, body + '\n' + LIVE_PATH_MARK + '\n' + LIVE_END_MARK + '\n')
     return config_path
 
 

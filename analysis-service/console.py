@@ -20,6 +20,7 @@ from catalog import ROOT, Store, EVENTS, model_status, validate_camera, validate
 from alerts import public_status
 from maintenance import BATCH_LIMIT, Maintenance
 import camera_source
+import live_cameras
 import process_scope
 
 VIDEO_TYPES = {'.mp4': 'video/mp4', '.webm': 'video/webm', '.ogg': 'video/ogg', '.mov': 'video/quicktime'}
@@ -738,25 +739,35 @@ class Controller:
     def camera_devices(self):
         """枚举本机摄像头并返回当前映射与 live 流运行状态。"""
         devices, error = camera_source.list_camera_devices(with_error=True)
-        mapping = camera_source.managed_paths(camera_source.live_config_path())
+        config = camera_source.live_config_path()
+        mapping = camera_source.managed_paths(config)
+        port = camera_source.config_rtsp_port(config.read_text(encoding='utf-8')) if config.exists() else 8554
         return {
-            'devices': devices,
+            'devices': live_cameras.device_rows(self, devices),
             'error': error,
             'livePaths': [{'path': name, 'device': device,
-                           'url': camera_source.live_stream_url(name)}
+                           'url': camera_source.live_stream_url(name, port)}
                           for name, device in sorted(mapping.items())],
             'stream': self.live_stream_status(),
         }
 
     def live_stream_status(self):
         session = read_json(STREAM_SESSION, {})
+        if not isinstance(session, dict):
+            session = {}
         try:
             pid = int((session or {}).get('managerPid') or 0)
         except (TypeError, ValueError):
             pid = 0
-        running = bool(pid and process_scope.pid_alive(pid))
-        return {'running': running, 'mode': (session or {}).get('mode', ''), 'pid': pid or None}
+        mode = (session or {}).get('mode', '')
+        active = bool(pid and live_cameras.stream_manager().identity_problem(session) is None)
+        return {'running': active and mode == 'live', 'active': active, 'mode': mode, 'pid': pid or None}
 
+    def configure_live_cameras(self, selections, start=True):
+        return live_cameras.configure(self, selections, start, model_status(), MAX_RUNNING)
+
+    @live_cameras.serialized_operation
+    @camera_source.serialized
     def save_live_camera(self, device, path_name=''):
         """把本机摄像头写入 live 配置；返回可直接填进视频配置的 RTSP 地址。"""
         if not isinstance(device, str) or not device.strip():
@@ -764,39 +775,58 @@ class Controller:
         devices, error = camera_source.list_camera_devices(with_error=True)
         if error:
             raise ValueError(error)
-        if device not in [item['name'] for item in devices if item['usable']]:
+        matches = [d for d in devices if d['usable'] and d.get('id', d['name']) == device]
+        if not matches:
+            matches = [d for d in devices if d['usable'] and d['name'] == device]
+        if len(matches) != 1:
             raise ValueError('该摄像头当前不可用，请刷新设备列表')
+        device = matches[0].get('id', matches[0]['name'])
         mapping = camera_source.managed_paths(camera_source.live_config_path())
+        if not isinstance(path_name, str):
+            raise ValueError('摄像头路径名无效')
         path_name = (path_name or '').strip()
         if not path_name:
+            path_name = next((p for p, d in mapping.items() if d == device), '')
+        if not path_name:
             index = 1
-            while 'livecam%d' % index in mapping:
+            while 'livecam%d' % index in camera_source.all_path_names(camera_source.live_config_path()):
                 index += 1
             path_name = 'livecam%d' % index
         config = camera_source.ensure_live_config()
         added = camera_source.upsert_live_path(config, path_name, device)
+        port = camera_source.config_rtsp_port(config.read_text(encoding='utf-8'))
         return {'ok': True, 'path': path_name, 'device': device.strip(),
-                'url': camera_source.live_stream_url(path_name), 'added': added,
+                'url': camera_source.live_stream_url(path_name, port), 'added': added,
                 'stream': self.live_stream_status(),
                 'message': '已写入配置；启动或重启“本机摄像头流”后即可添加该地址'}
 
+    @live_cameras.serialized_operation
     def remove_live_camera(self, path_name):
-        if not isinstance(path_name, str) or not camera_source.PATH_NAME.match(path_name):
+        if not isinstance(path_name, str) or not camera_source.PATH_NAME.fullmatch(path_name):
             raise ValueError('摄像头路径名无效')
-        removed = camera_source.remove_live_path(camera_source.live_config_path(), path_name)
+        with self.lock:
+            if any(c.get('livePath') == path_name and self.running(c['id']) for c in self.store.cameras):
+                raise ValueError('请先停止这路分析再移除映射')
+            removed = camera_source.remove_live_path(camera_source.live_config_path(), path_name)
         if not removed:
             raise ValueError('该摄像头路径不存在')
         return {'ok': True, 'path': path_name, 'stream': self.live_stream_status(),
                 'message': '已移除；重启“本机摄像头流”后生效'}
 
+    @live_cameras.serialized_operation
     def control_live_streams(self, action):
         """启动/停止 live 模式 MediaMTX；复用 stream_control 的身份校验与作业对象。"""
         if action not in ('start', 'stop'):
             raise ValueError('操作无效')
+        state = self.live_stream_status()
+        if state.get('active') and state.get('mode') != 'live':
+            raise ValueError('模拟流正在运行，本机摄像头面板不能停止或替换模拟流')
+        if action == 'start' and state.get('running'):
+            return {'ok': True, 'action': action, 'stream': state}
         if not STREAM_CONTROL.is_file():
             raise ValueError('未找到 kstool/mediamtx/stream_control.py')
         command = [sys.executable, str(STREAM_CONTROL)]
-        command += ['start', '--mode', 'live'] if action == 'start' else ['stop']
+        command += ['start', '--mode', 'live'] if action == 'start' else ['stop', '--expected-mode', 'live']
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
         try:
             result = subprocess.run(
@@ -952,7 +982,8 @@ def make_handler(controller, token):
             route = unquote(urlsplit(self.path).path)
             static = {'/': ('console.html', 'text/html; charset=utf-8'),
                       '/console.css': ('console.css', 'text/css; charset=utf-8'),
-                      '/console.js': ('console.js', 'text/javascript; charset=utf-8')}
+                      '/console.js': ('console.js', 'text/javascript; charset=utf-8'),
+                      '/live-cameras.js': ('live-cameras.js', 'text/javascript; charset=utf-8')}
             if route in static:
                 name, kind = static[route]
                 return self.reply(200, (ROOT/name).read_bytes(), kind)
@@ -963,7 +994,10 @@ def make_handler(controller, token):
             if route == '/api/samples':
                 return self.reply(200, controller.samples())
             if route == '/api/cameras/devices':
-                return self.reply(200, controller.camera_devices())
+                try:
+                    return self.reply(200, controller.camera_devices())
+                except (ValueError, OSError) as exc:
+                    return self.reply(400, {'error': str(exc)})
             if route == '/api/alerts/outbox':
                 params = parse_qs(urlsplit(self.path).query)
                 camera_id = (params.get('cameraId') or [''])[0].strip()
@@ -1039,6 +1073,9 @@ def make_handler(controller, token):
                 if self.path == '/api/cameras/live':
                     return self.reply(200, controller.save_live_camera(
                         data.get('device'), data.get('path') or ''))
+                if self.path == '/api/cameras/live/batch':
+                    return self.reply(200, controller.configure_live_cameras(
+                        data.get('selections'), data.get('start', True)))
                 if self.path == '/api/cameras/live/remove':
                     return self.reply(200, controller.remove_live_camera(data.get('path')))
                 if self.path == '/api/cameras/live/streams':
