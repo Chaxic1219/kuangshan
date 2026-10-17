@@ -1,5 +1,8 @@
 # 矿区摄像头 RTSP 模拟服务（MediaMTX）
 
+> 运维、备份与回滚见 [../../docs/operations.md](../../docs/operations.md)；
+> 联合验收见 [../../docs/acceptance.md](../../docs/acceptance.md)。
+
 ## 目录结构
 - `bin/mediamtx.exe` — 流媒体服务器（v1.21.0）
 - `bin/ffmpeg_bin/` — FFmpeg（负责把本地视频循环推成 RTSP 流）

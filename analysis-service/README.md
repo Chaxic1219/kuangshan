@@ -82,6 +82,19 @@ precision/recall，固定标记 `assessment=measurement_only`：没有业务阈�
 无标注时只能测量检出数量：`python evaluate_accuracy.py measure --model general --images <dir>`。
 报告不会写“准确率合格”。人员、装备、烟火应分别用现场正负样本统计漏报与误报。
 
+## 运维与验收
+
+运维、备份与回滚步骤见 [../docs/operations.md](../docs/operations.md)。联合验收脚本：
+
+```powershell
+python acceptance.py --minutes 2      # 短时：6 路含模拟流、至少 4 路分析
+python acceptance.py --minutes 480    # 8 小时稳定性（固定机器）
+```
+
+验收计划、预期可观察行为与 8 小时清单见 [../docs/acceptance.md](../docs/acceptance.md)，
+本次短时结果见 [../docs/acceptance-report-2026-10-17.md](../docs/acceptance-report-2026-10-17.md)。
+报告写入 `runs/acceptance-<时间>/report.json` 与 `report.md`。
+
 ## 容量与稳定性
 
 | 变量 | 默认 | 说明 |
