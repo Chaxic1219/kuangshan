@@ -64,6 +64,24 @@
 
 事件记录页可直接**导出 CSV**（带 UTF-8 BOM，Excel 打开不乱码）。
 
+## 准确率测量（可选）
+
+准确率不能用“检出数量”代替。带标注样本时运行：
+
+```powershell
+python evaluate_accuracy.py template --video kstool/mediamtx/videos/camera5.mp4 --out dataset --count 30 --step 30
+python evaluate_accuracy.py evaluate --model ppe --images dataset/images --annotations dataset/labels.jsonl
+```
+
+标注格式：`labels.jsonl` 每行
+`{"image": "frame_00001.jpg", "boxes": [{"label": "NO-Hardhat", "bbox": [x1, y1, x2, y2]}]}`，
+bbox 为 0~1 归一化 xyxy，label 使用模型类别名。报告按标签统计 TP/FP/FN 与
+precision/recall，固定标记 `assessment=measurement_only`：没有业务阈值和现场标注集时
+只报告测量结果，不判定准确率是否达标。
+
+无标注时只能测量检出数量：`python evaluate_accuracy.py measure --model general --images <dir>`。
+报告不会写“准确率合格”。人员、装备、烟火应分别用现场正负样本统计漏报与误报。
+
 ## 容量与稳定性
 
 | 变量 | 默认 | 说明 |
@@ -86,6 +104,7 @@
 ## 主要文件
 
 - `maintenance.py` 可再生运行文件清理（预览/执行、引用保护、低空间检测）
+- `evaluate_accuracy.py` 离线准确率测量（标注模板、漏报/误报统计，不判定合格）
 - `catalog.py` 视频配置、场景与模型目录
 - `detectors.py` YOLO / OpenCV 场景适配
 - `regions.py` 多边形校验与进入状态
