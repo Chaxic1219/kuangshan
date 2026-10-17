@@ -29,6 +29,14 @@ def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def write_atomic(path, data):
+    """同目录临时文件 + 原子替换，避免读者读到写了一半的文件。"""
+    path = Path(path)
+    temp = path.with_name(path.name + '.tmp')
+    temp.write_bytes(data)
+    temp.replace(path)
+
+
 def validate_config(data):
     cameras = data.get('cameras') if isinstance(data, dict) else None
     if not isinstance(cameras, list) or not cameras:
@@ -140,9 +148,9 @@ class Engine(Dispatcher):
             if not ok:
                 raise OSError('截图编码失败')
             encoded = jpeg.tobytes()
-            live.write_bytes(encoded)
+            write_atomic(live, encoded)
             if not path.exists():
-                path.write_bytes(encoded)
+                write_atomic(path, encoded)
             # frameSha256 必须能由落盘的证据图复现：JPEG 有损，若对编码前的原始帧
             # 取哈希，校验方永远无法用截图复算出来。因此对实际写出的像素取哈希，
             # 同一帧被多个任务复用，按 seq 缓存避免重复解码。
@@ -177,12 +185,7 @@ class Engine(Dispatcher):
                 self.alerts.submit(evidence, path)
             self.count += 1
             if self.count % 60 == 0:
-                retained = {r['snapshot'] for r in self.latest.values()}
-                for old in self.directory.joinpath('frames').glob('*.*'):
-                    if old.suffix.lower() not in ('.jpg', '.png'):
-                        continue
-                    if seq - int(old.stem) > 300 and (Path(self.camera['id'])/'frames'/old.name).as_posix() not in retained:
-                        old.unlink(missing_ok=True)
+                self._cleanup_frames()
         except OSError as exc:
             self.fatal = exc
             raise
@@ -197,6 +200,22 @@ class Engine(Dispatcher):
         self.inference.run()
         if self.fatal:
             raise self.fatal
+
+    def _cleanup_frames(self):
+        """普通帧按最后写入时间保留至少 60 秒；latest 引用的帧始终保护。"""
+        retained = {r['snapshot'] for r in self.latest.values()}
+        cutoff = time.time() - 60
+        for old in self.directory.joinpath('frames').glob('*.*'):
+            if old.suffix.lower() not in ('.jpg', '.png'):
+                continue
+            if (Path(self.camera['id'])/'frames'/old.name).as_posix() in retained:
+                continue
+            try:
+                if old.stat().st_mtime > cutoff:
+                    continue
+                old.unlink(missing_ok=True)
+            except OSError:
+                continue
 
     def close(self):
         self.alerts.close()

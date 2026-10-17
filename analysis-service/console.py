@@ -247,8 +247,8 @@ class Controller:
                     stamp = int(live_path.stat().st_mtime_ns // 1_000_000)
                     live = '/media/' + live_path.relative_to(self.work/'runtime').as_posix() + f'?v={stamp}'
             for record in latest.values():
-                # 分析中优先用同步 live 帧，检测框与画面内容一致。
-                record['image'] = live or ('/media/' + (run/record['snapshot']).relative_to(self.work/'runtime').as_posix())
+                # 分析画面必须与该结果自己的 snapshot 一致；live.jpg 只保留为兼容字段。
+                record['image'] = '/media/' + (run/record['snapshot']).relative_to(self.work/'runtime').as_posix()
                 task = tasks.get(record.get('eventId'))
                 bound = set(task.get('regionIds', [])) if task else set()
                 record['regions'] = [copy.deepcopy(zones[zid]) for zid in bound
