@@ -137,7 +137,7 @@ const LivePanel = (() => {
     } finally { operating = false; render(); }
   }
 
-  document.querySelector('#content').addEventListener('change', event => {
+  document.querySelector('#live-dialog').addEventListener('change', event => {
     const row = event.target.closest('[data-device-id]');
     if (!row) return;
     const draft = drafts.get(row.dataset.deviceId);
@@ -155,7 +155,7 @@ const LivePanel = (() => {
     sync();
   });
 
-  document.querySelector('#content').addEventListener('click', async event => {
+  document.querySelector('#live-dialog').addEventListener('click', async event => {
     const button = event.target.closest('[data-local-action]');
     if (!button || button.disabled) return;
     const action = button.dataset.localAction;

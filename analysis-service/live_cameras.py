@@ -176,3 +176,110 @@ def _configure(controller, selections, start, models, capacity):
             except (ValueError, OSError, RuntimeError) as exc:
                 result.update(ok=False, status='failed', message=str(exc))
     return {'ok': all(r['ok'] for r in results), 'results': results}
+
+
+@serialized_operation
+def adopt_single(controller, device_id, camera, start, models, capacity):
+    """单路接入（编辑器用）：保存本机摄像头视频配置、启动推流并截取封面。
+
+    与批量面板的区别：允许区域任务（编辑器可绘制区域），保留编辑器里的
+    tasks/regions/名称与位置；保存后不自动启动分析，用户回到卡片点“开始分析”。
+    """
+    if not isinstance(device_id, str) or not device_id:
+        raise ValueError('请选择本机摄像头')
+    if not isinstance(camera, dict) or not isinstance(camera.get('name'), str) \
+            or not camera['name'].strip():
+        raise ValueError('请填写视频名称')
+    tasks = camera.get('tasks')
+    if not isinstance(tasks, list) or not tasks:
+        raise ValueError('请至少选择一个检测场景')
+    if type(start) is not bool:
+        raise ValueError('启动参数须为布尔值')
+    devices, error = source.list_camera_devices(with_error=True)
+    devices = {d.get('id', d.get('name')): d for d in devices}
+    ready = {m['id'] for m in models if m['ready']}
+    for task in tasks:
+        if not isinstance(task, dict) or task.get('eventId') not in EVENTS:
+            raise ValueError('检测场景无效')
+        if EVENTS[task['eventId']]['model'] not in ready:
+            raise ValueError('所选场景的模型权重尚未就绪')
+    with controller.lock, source.CONFIG_LOCK:
+        existing = next((c for c in controller.store.cameras
+                         if c.get('liveDeviceId') == device_id), None)
+        editing = camera.get('id') or (existing or {}).get('id')
+        device = devices.get(device_id)
+        if device is None and existing is None:
+            raise ValueError(error or '所选设备已断开，请重新检测')
+        if device is not None and not device.get('usable', True):
+            raise ValueError(device.get('error') or '设备无法用于视频采集')
+        if editing and controller.running(editing):
+            current = controller.store.get(editing)
+            current_tasks = {(t['eventId'], t.get('enabled', True),
+                              tuple(sorted(t.get('regionIds', []))))
+                             for t in (current or {}).get('tasks', [])}
+            new_tasks = {(t['eventId'], t.get('enabled', True),
+                          tuple(sorted(t.get('regionIds', [])))) for t in tasks}
+            if current is None or current.get('liveDeviceId') != device_id \
+                    or current_tasks != new_tasks:
+                raise ValueError('请先停止这路分析再修改配置')
+        config = source.ensure_live_config()
+        mapping = source.managed_paths(config)
+        names = source.all_path_names(config)
+        port = source.config_rtsp_port(config.read_text(encoding='utf-8'))
+        path = (existing or {}).get('livePath') or next(
+            (p for p, d in mapping.items() if d == device_id), '')
+        if not path:
+            index = 1
+            while 'livecam%d' % index in names:
+                index += 1
+            path = 'livecam%d' % index
+        name = device['name'] if device else (existing or {}).get('liveDeviceName', device_id)
+        camera_doc = {
+            **(existing or {}),
+            'id': editing or uuid.uuid4().hex[:12],
+            'name': camera['name'].strip(),
+            'location': (camera.get('location') or '').strip(),
+            'url': source.live_stream_url(path, port),
+            'tasks': tasks,
+            'regions': camera.get('regions') or [],
+            'liveDeviceId': device_id,
+            'liveDeviceName': name,
+            'livePath': path,
+            'cover': (existing or {}).get('cover') or camera.get('cover') or '',
+        }
+        camera_doc = validate_camera(camera_doc)
+        before = config.read_text(encoding='utf-8')
+        source.write_live_config(config, {path: device_id})
+        replacements = {camera_doc['id']: camera_doc}
+        updated = [replacements.pop(c['id'], c) for c in controller.store.cameras] \
+            + list(replacements.values())
+        try:
+            atomic_json(controller.store.path, updated)
+        except OSError:
+            source.atomic_text(config, before)
+            raise
+        controller.store.cameras = updated
+    result = {'ok': True, 'cameraId': camera_doc['id'], 'url': camera_doc['url'],
+              'status': 'saved', 'message': '配置已保存'}
+    if device is None:
+        result['message'] = '设备离线，配置已保存；连接后可启动分析'
+        return result
+    try:
+        if not controller.live_stream_status().get('running'):
+            controller.control_live_streams('start')
+        if not source.wait_live_ready(path):
+            raise ValueError('摄像头未在 12 秒内出流，请检查占用、连接与支持格式')
+        probe = controller.probe(camera_doc['url'])
+        with controller.lock:
+            current = controller.store.get(camera_doc['id'])
+            if current is not None:
+                current['cover'] = probe['cover']
+                controller.store.save(current)
+        if start:
+            controller.start(camera_doc['id'])
+            result.update(status='starting', message='已读到首帧，分析正在启动')
+        else:
+            result.update(status='saved', message='已保存并启动本机推流，可点击“开始分析”')
+    except (ValueError, OSError, RuntimeError) as exc:
+        result.update(ok=False, message='配置已保存，但%s' % exc)
+    return result

@@ -31,3 +31,9 @@
 .live-empty{padding:24px 0}
 .live-body .error{color:var(--danger)}
 @media(max-width:680px){.live-actions{justify-content:stretch}.live-actions>span{flex-basis:100%}.live-actions button{flex:1}.live-toolbar{align-items:flex-start}.live-service{flex-basis:100%}}
+.heading-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.source-tabs{display:flex;gap:8px;margin:0 0 18px}
+.source-tabs button{padding:9px 16px;border:1px solid var(--line);background:#fff;border-radius:8px;cursor:pointer;color:#526572;font:inherit}
+.source-tabs button.active{border-color:var(--accent);color:var(--accent);background:#eefaf7}
+#live-dialog .modalcontent{max-height:70vh;overflow:auto}
+@media(max-width:680px){.heading-actions{width:100%;justify-content:flex-start}}

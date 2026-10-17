@@ -140,6 +140,70 @@ class LiveSelectionTests(unittest.TestCase):
         self.assertEqual(len(self.c.store.cameras), 1)
         self.assertEqual(camera_source.managed_paths(self.config), {'livecam1': '@first'})
 
+    def draft_camera(self, **overrides):
+        camera = {'id': '', 'name': '本机摄像头', 'location': '东区',
+                  'tasks': [{'eventId': 'fire', 'confidence': .5, 'interval': 1,
+                             'cooldown': 10, 'enabled': True, 'regionIds': []}],
+                  'regions': []}
+        camera.update(overrides)
+        return camera
+
+    def test_adopt_creates_live_camera_with_cover(self):
+        with patch.object(self.c, 'control_live_streams') as streams, \
+                patch.object(self.c, 'probe', return_value={'cover': '/covers/live.jpg'}) as probe:
+            result = self.c.adopt_live_camera('@first', self.draft_camera())
+        self.assertTrue(result['ok'], result)
+        self.assertIn('livecam1', result['url'])
+        cameras = Store(self.work).cameras
+        self.assertEqual(len(cameras), 1)
+        self.assertEqual(cameras[0]['liveDeviceId'], '@first')
+        self.assertEqual(cameras[0]['tasks'][0]['eventId'], 'fire')
+        self.assertEqual(cameras[0]['cover'], '/covers/live.jpg')
+        self.assertEqual(camera_source.managed_paths(self.config), {'livecam1': '@first'})
+        streams.assert_called_once_with('start')
+        probe.assert_called_once()
+
+    def test_adopt_reuses_camera_and_mapping(self):
+        with patch.object(self.c, 'control_live_streams'), \
+                patch.object(self.c, 'probe', return_value={'cover': '/covers/live.jpg'}):
+            first = self.c.adopt_live_camera('@first', self.draft_camera())
+            second = self.c.adopt_live_camera('@first', self.draft_camera(name='改名后'))
+        self.assertEqual(first['cameraId'], second['cameraId'])
+        self.assertEqual(len(Store(self.work).cameras), 1)
+        self.assertEqual(Store(self.work).cameras[0]['name'], '改名后')
+        self.assertEqual(camera_source.managed_paths(self.config), {'livecam1': '@first'})
+
+    def test_adopt_rejects_change_while_running(self):
+        with patch.object(self.c, 'control_live_streams'), \
+                patch.object(self.c, 'probe', return_value={'cover': '/covers/live.jpg'}):
+            self.c.adopt_live_camera('@first', self.draft_camera())
+        with patch.object(self.c, 'running', return_value=True):
+            with self.assertRaises(ValueError):
+                self.c.adopt_live_camera('@first', self.draft_camera(
+                    tasks=[{'eventId': 'no_helmet', 'confidence': .5, 'interval': 1,
+                            'cooldown': 10, 'enabled': True, 'regionIds': []}]))
+        self.assertEqual(Store(self.work).cameras[0]['tasks'][0]['eventId'], 'fire')
+
+    def test_adopt_offline_device_keeps_config_without_stream(self):
+        with patch.object(self.c, 'control_live_streams'), \
+                patch.object(self.c, 'probe', return_value={'cover': '/covers/live.jpg'}):
+            self.c.adopt_live_camera('@first', self.draft_camera())
+        self.devices.clear()
+        with patch.object(self.c, 'control_live_streams') as streams, \
+                patch.object(self.c, 'probe') as probe:
+            result = self.c.adopt_live_camera('@first', self.draft_camera(name='离线改名'))
+        self.assertTrue(result['ok'])
+        self.assertIn('离线', result['message'])
+        streams.assert_not_called()
+        probe.assert_not_called()
+        self.assertEqual(Store(self.work).cameras[0]['name'], '离线改名')
+
+    def test_adopt_requires_tasks_and_device(self):
+        with self.assertRaises(ValueError):
+            self.c.adopt_live_camera('@first', self.draft_camera(tasks=[]))
+        with self.assertRaises(ValueError):
+            self.c.adopt_live_camera('', self.draft_camera())
+
     def test_stop_command_rejects_other_mode(self):
         from live_cameras import stream_manager
         manager = stream_manager()

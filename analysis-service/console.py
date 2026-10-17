@@ -766,6 +766,10 @@ class Controller:
     def configure_live_cameras(self, selections, start=True):
         return live_cameras.configure(self, selections, start, model_status(), MAX_RUNNING)
 
+    def adopt_live_camera(self, device_id, camera, start=False):
+        return live_cameras.adopt_single(self, device_id, camera, start,
+                                         model_status(), MAX_RUNNING)
+
     @live_cameras.serialized_operation
     @camera_source.serialized
     def save_live_camera(self, device, path_name=''):
@@ -1076,6 +1080,9 @@ def make_handler(controller, token):
                 if self.path == '/api/cameras/live/batch':
                     return self.reply(200, controller.configure_live_cameras(
                         data.get('selections'), data.get('start', True)))
+                if self.path == '/api/cameras/live/adopt':
+                    return self.reply(200, controller.adopt_live_camera(
+                        data.get('deviceId'), data.get('camera'), data.get('start', False)))
                 if self.path == '/api/cameras/live/remove':
                     return self.reply(200, controller.remove_live_camera(data.get('path')))
                 if self.path == '/api/cameras/live/streams':
