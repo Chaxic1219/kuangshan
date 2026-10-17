@@ -74,6 +74,8 @@
 
 每路视频是一个 Windows 作业对象（Job Object）：控制台异常退出或关闭最后句柄时，该路进程组随之终止；同一数据目录只允许一个控制台实例（命名互斥量），不同数据目录可并行。故障后按 1/2/5/10/30 秒退避自动恢复，十分钟内最多自动重启 5 次，超限进入 `failed` 并等待人工启动；`/api/state` 的 `lifecycle`（starting/active/stopping/backoff/failed/stopped）、`lastFailure`、`nextRestartIn` 会返回给页面，暂停状态不会被展示成正常运行。
 
+存储维护：可再生运行文件由 `maintenance.py` 每十分钟有界清理（每批最多 100 个候选）：`latest` 引用帧始终保护，其余帧至少保留 60 秒；已结束运行/冒烟目录保留 7 天；无引用封面与 outbox 截图保留 24 小时；事件数据库、证据图、权重与源视频不自动删除。`results.jsonl`/`events.jsonl` 单文件 20 MiB，最多保留 5 个轮转文件。数据目录（及启用上报时的上传目录卷）低于 5 GiB 提示、低于 1 GiB 拒绝启动新分析并停止现有任务，需清理后人工重新启动。文件被占用时跳过并记录；目录穿越、符号链接与 junction 拒绝删除。预览候选：`python maintenance.py --work data --runs runs`（默认只预览，`--execute` 才删除）。
+
 每路视频一个进程并各自加载权重，并发数直接决定内存与 CPU 占用；卡死时只重建
 受影响的那一路，其他路继续运行（同路多个场景会一起短暂重启，这是首版的隔离边界）。
 
@@ -83,6 +85,7 @@
 
 ## 主要文件
 
+- `maintenance.py` 可再生运行文件清理（预览/执行、引用保护、低空间检测）
 - `catalog.py` 视频配置、场景与模型目录
 - `detectors.py` YOLO / OpenCV 场景适配
 - `regions.py` 多边形校验与进入状态

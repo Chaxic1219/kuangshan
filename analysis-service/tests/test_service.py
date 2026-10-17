@@ -6,8 +6,11 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 import cv2
 import numpy as np
+import service as service_module
 from service import Engine, validate_config, validate_result
 
 
@@ -79,3 +82,28 @@ class ServiceTests(unittest.TestCase):
         for box, conf in [([.8, 0, .2, 1], .5), ([0,0,1,1], float('nan'))]:
             with self.assertRaises(ValueError):
                 validate_result({'detections': [{'bbox': box, 'confidence': conf}]}, 'general')
+
+    def test_log_rotation_keeps_bounded_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = Engine(validate_config(config())[0], Path(tmp), 'rotate')
+            try:
+                with patch.object(service_module, 'LOG_MAX_BYTES', 512):
+                    for index in range(40):
+                        engine.event('tick', index=index)
+            finally:
+                engine.close()
+            camera_dir = Path(tmp)/'A'
+            rotations = sorted(camera_dir.glob('events.jsonl.*'))
+            self.assertTrue(rotations, '超过单文件上限应产生轮转文件')
+            self.assertLessEqual(len(rotations), service_module.LOG_ROTATIONS,
+                                 '轮转文件数量不得超过上限')
+            self.assertTrue((camera_dir/'events.jsonl').exists())
+
+    def test_rejects_start_when_disk_low(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(service_module.shutil, 'disk_usage',
+                              return_value=SimpleNamespace(free=service_module.LOW_SPACE_BLOCK - 1,
+                                                           total=10 ** 12)):
+                with self.assertRaises(ValueError) as ctx:
+                    service_module.run_service(config(), Path(tmp), 1)
+            self.assertIn('磁盘', str(ctx.exception))

@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, urlsplit, unquote
 import uuid
 from catalog import ROOT, Store, EVENTS, model_status, validate_camera, validate_source, atomic_json, identifier, MEDIA_ROOT, resolve_source
 from alerts import public_status
+from maintenance import BATCH_LIMIT, Maintenance
 import process_scope
 
 VIDEO_TYPES = {'.mp4': 'video/mp4', '.webm': 'video/webm', '.ogg': 'video/ogg', '.mov': 'video/quicktime'}
@@ -81,6 +82,71 @@ class Controller:
         self.watchdog_stop = threading.Event()
         self.watchdog = threading.Thread(target=self._watch, daemon=True)
         self.watchdog.start()
+        self.maintenance = Maintenance(self.work, runs=ROOT/'runs')
+        self.maintenance_status = {}
+        self.storage_status = {}
+        self.maintenance_stop = threading.Event()
+        self.maintenance_thread = threading.Thread(target=self._maintain_loop, daemon=True)
+        self.maintenance_thread.start()
+
+    # ==================== 存储维护与空间守卫 ====================
+
+    def _maintain_loop(self):
+        """每十分钟执行一次有界清理，并检查磁盘空间。"""
+        while not self.maintenance_stop.wait(600):
+            try:
+                self._maintain()
+            except Exception:
+                self.maintenance_status = {'at': datetime.now(timezone.utc).isoformat(),
+                                           'error': '维护任务失败'}
+
+    def _active_run_dirs(self):
+        active = []
+        with self.lock:
+            for cid in list(self.jobs):
+                job = self.jobs.get(cid)
+                if job and job['lifecycle'] in LIFECYCLE_ADMITTED:
+                    active.append(job['folder'])
+        return active
+
+    def disk_status(self):
+        extra = []
+        if os.environ.get('KUANGSHAN_ALERT_API_URL'):
+            extra.append(os.environ.get('KUANGSHAN_ALERT_UPLOAD_ROOT', r'D:\kuangshanai-uploads'))
+        return self.maintenance.disk_status(extra_paths=extra)
+
+    def _storage_guard(self):
+        """空间低于 1 GiB 时停止运行中的分析，并等待人工重启。"""
+        status = self.disk_status()
+        self.storage_status = status
+        if status.get('level') != 'blocked':
+            return
+        with self.lock:
+            targets = [(cid, job['generation']) for cid, job in self.jobs.items()
+                       if job['lifecycle'] in LIFECYCLE_ADMITTED]
+        for cid, generation in targets:
+            with self.lock:
+                job = self.jobs.get(cid)
+                if not job or job['generation'] != generation:
+                    continue
+                job['desiredRunning'] = False
+                job['nextRestartMonotonic'] = None
+                job['restartHistory'] = []
+            self._fail(cid, generation, '存储空间不足，分析已停止')
+
+    def _maintain(self):
+        active = self._active_run_dirs()
+        report = self.maintenance.execute(active_dirs=active, limit=BATCH_LIMIT)
+        self.maintenance_status = {
+            'at': datetime.now(timezone.utc).isoformat(),
+            'deleted': len(report.get('deleted') or []),
+            'skipped': len(report.get('skipped') or []),
+            'unknown': len(report.get('unknown') or []),
+            'errors': list(report.get('errors') or []),
+            'stopped': report.get('stopped', ''),
+        }
+        self._storage_guard()
+        return report
 
     # ==================== 生命周期状态机 ====================
 
@@ -340,6 +406,8 @@ class Controller:
         camera['cameraName'] = camera['name']
         # outbox 按摄像头固定，与每次运行的一次性目录解耦，停止/重启后仍能补发。
         camera['outbox'] = str(self.work/'outbox'/cid/'outbox.db')
+        if self.disk_status().get('level') == 'blocked':
+            raise ValueError('磁盘剩余空间不足 1 GiB，请清理后重新启动分析')
         with self.lock:
             job = self.jobs.get(cid)
             if job and job['desiredRunning'] and job['lifecycle'] in LIFECYCLE_ADMITTED:
@@ -516,7 +584,9 @@ class Controller:
                                  'initialTimeoutSeconds': INITIAL_TIMEOUT_SECONDS,
                                  'cpuScope': 'process',
                                  'rssMb': round(used['rssMb'], 1) if sample_count else None,
-                                 'cpuPercent': round(used['cpuPercent'], 1) if sample_count else None}}
+                                 'cpuPercent': round(used['cpuPercent'], 1) if sample_count else None,
+                                 'storage': self.disk_status(),
+                                 'maintenance': dict(self.maintenance_status)}}
 
     # ==================== 待发送队列 ====================
 
@@ -675,10 +745,13 @@ class Controller:
         return [{'name': p.stem, 'url': p.resolve().as_posix()} for p in sorted(media.glob('*.mp4'))]
 
     def close(self):
-        """关闭控制台：先停看门狗并等待结束，再回收本服务拥有的全部作业。"""
+        """关闭控制台：先停看门狗与维护线程，再回收本服务拥有的全部作业。"""
         self.watchdog_stop.set()
         if self.watchdog.is_alive():
             self.watchdog.join(timeout=10)
+        self.maintenance_stop.set()
+        if self.maintenance_thread.is_alive():
+            self.maintenance_thread.join(timeout=10)
         for cid in list(self.jobs):
             try:
                 self.stop(cid)
@@ -797,6 +870,10 @@ def make_handler(controller, token):
                     rows = controller.outbox_rows(camera_id, state, limit, offset)
                 return self.reply(200, {'rows': rows, 'limit': max(1, min(limit, 100)),
                                         'offset': max(0, offset)})
+            if route == '/api/maintenance/plan':
+                with controller.lock:
+                    report = controller.maintenance.plan(active_dirs=controller._active_run_dirs())
+                return self.reply(200, report)
             if route == '/api/alerts/export.csv':
                 # 事件记录导出：带 BOM，保证 Excel 直接打开中文不乱码。
                 body = '\ufeff' + controller.alerts_csv()
@@ -846,6 +923,8 @@ def make_handler(controller, token):
                     return self.reply(200, controller.probe(data.get('url')))
                 if self.path == '/api/alerts/retry':
                     return self.reply(200, controller.retry_outbox(data.get('cameraId'), data.get('id')))
+                if self.path == '/api/maintenance/run':
+                    return self.reply(200, controller._maintain())
                 with controller.lock:
                     if self.path == '/api/cameras/save':
                         return self.reply(200, {'camera': controller.save(data)})

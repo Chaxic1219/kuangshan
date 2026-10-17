@@ -282,6 +282,33 @@ class CapacityTests(unittest.TestCase):
         self.assertEqual(capacity['sampledRunning'], 0)
         self.assertIsNone(capacity['rssMb'], '无运行样本时不返回假零值')
 
+    # ---------- 存储保护 ----------
+
+    def test_start_blocked_by_low_disk(self):
+        cid = self.add('低空间')['id']
+        with patch.object(Controller, 'disk_status',
+                          return_value={'level': 'blocked', 'freeGiB': 0.5, 'items': []}):
+            with self.assertRaises(ValueError) as ctx:
+                self.c.start(cid)
+        self.assertIn('磁盘', str(ctx.exception))
+        self.assertNotIn(cid, self.c.jobs, '低空间被拒绝的任务不进入任务表')
+
+    def test_storage_guard_stops_running_analysis(self):
+        cid = self.add('存储停止')['id']
+        self.c.start(cid)
+        job = self.c.jobs[cid]
+        with patch.object(Controller, 'disk_status',
+                          return_value={'level': 'blocked', 'freeGiB': 0.5, 'items': []}):
+            self.c._storage_guard()
+        self.assertEqual(job['lifecycle'], 'stopped')
+        self.assertFalse(job['desiredRunning'], '空间恢复后要求人工重新启动')
+        self.assertIn('存储空间不足', job['lastFailure'])
+
+    def test_state_exposes_storage_and_maintenance(self):
+        state = self.c.state()
+        self.assertIn('storage', state['capacity'])
+        self.assertIn('maintenance', state['capacity'])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -7,6 +7,7 @@ import json
 import multiprocessing as mp
 from pathlib import Path
 import signal
+import shutil
 import sqlite3
 import threading
 import time
@@ -23,6 +24,7 @@ from catalog import EVENTS, validate_camera, number, atomic_json, resolve_source
 from detectors import ModelPool, SceneAlgo
 from regions import EntryState, contains
 from alerts import AlertReporter
+from maintenance import LOG_MAX_BYTES, LOG_ROTATIONS, LOW_SPACE_BLOCK
 
 
 def now():
@@ -82,8 +84,10 @@ class Engine(Dispatcher):
         self.directory = output / camera['id']
         self.directory.mkdir(parents=True)
         (self.directory / 'frames').mkdir()
-        self.results = (self.directory / 'results.jsonl').open('a', encoding='utf-8', buffering=1)
-        self.events = (self.directory / 'events.jsonl').open('a', encoding='utf-8', buffering=1)
+        self.results_path = self.directory / 'results.jsonl'
+        self.events_path = self.directory / 'events.jsonl'
+        self.results = self.results_path.open('a', encoding='utf-8', buffering=1)
+        self.events = self.events_path.open('a', encoding='utf-8', buffering=1)
         self.tasks = {t['id']: t for t in camera['tasks']}
         self.context = None
         self.last_seq = 0
@@ -108,7 +112,27 @@ class Engine(Dispatcher):
             # interval=0：每个新帧都推理，实现持续检测（实际频率受 CPU 限制）。
             self.inference.load_algo(SceneAlgo(task, self.pool, zones), 1, 0, float(task['interval']))
 
+    def _ensure_log_size(self, stream, path):
+        """超过单文件上限时轮转，最多保留 LOG_ROTATIONS 个历史文件。"""
+        try:
+            if stream.tell() < LOG_MAX_BYTES:
+                return stream
+        except (OSError, ValueError):
+            return stream
+        try:
+            stream.close()
+            path.with_name(path.name + '.%d' % LOG_ROTATIONS).unlink(missing_ok=True)
+            for index in range(LOG_ROTATIONS - 1, 0, -1):
+                source = path.with_name(path.name + '.%d' % index)
+                if source.exists():
+                    source.replace(path.with_name(path.name + '.%d' % (index + 1)))
+            path.replace(path.with_name(path.name + '.1'))
+        except OSError:
+            pass
+        return path.open('a', encoding='utf-8', buffering=1)
+
     def event(self, kind, **fields):
+        self.events = self._ensure_log_size(self.events, self.events_path)
         self.events.write(json.dumps(
             {'type': kind, 'at': now(), 'cameraId': self.camera['id'], **fields}, ensure_ascii=False) + '\n')
 
@@ -172,6 +196,7 @@ class Engine(Dispatcher):
                 'snapshot': relative.as_posix(), 'detections': shown, 'regions': zones,
                 'frameSha256': self._frame_sha, 'alarm': bool(accepted)}
             self.latest[algo_name] = record
+            self.results = self._ensure_log_size(self.results, self.results_path)
             self.results.write(json.dumps(record, ensure_ascii=False, allow_nan=False)+'\n')
             if accepted:
                 evidence = {**record, 'detections': accepted, 'id': uuid.uuid4().hex}
@@ -374,10 +399,21 @@ def camera_worker(camera, output, run_id, stop):
             'resource': sampler.sample()})
 
 
+def _ensure_disk_space(path):
+    """数据目录所在卷低于 1 GiB 时拒绝启动新分析。"""
+    try:
+        free = shutil.disk_usage(str(Path(path).resolve())).free
+    except OSError:
+        return
+    if free < LOW_SPACE_BLOCK:
+        raise ValueError('磁盘剩余空间不足 1 GiB，拒绝启动分析；请清理空间后重试')
+
+
 def run_service(config, output, duration=60):
     cameras = validate_config(config)
     if not number(duration, 0, 86400):
         raise ValueError('运行时长须为 0（持续运行）至 86400 秒')
+    _ensure_disk_space(output)
     run_id = uuid.uuid4().hex
     directory = Path(output).resolve() / run_id
     directory.mkdir(parents=True)
