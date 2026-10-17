@@ -70,7 +70,7 @@ class HttpStatusOpener:
 
 class AlertBridgeTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.root = Path(self.tmp.name)
         self.snapshot = self.root / 'frame.png'
         self.snapshot.write_bytes(b'\x89PNG\r\n\x1a\nfake')
@@ -79,6 +79,9 @@ class AlertBridgeTests(unittest.TestCase):
 
     def tearDown(self):
         self.patcher.stop()
+        # reporter.close 注册在 addCleanup，默认在 tearDown 之后执行；
+        # 先手动跑完清理，避免临时目录里的 SQLite 文件仍被发送线程占用。
+        self.doCleanups()
         self.tmp.cleanup()
 
     def reporter(self, opener, max_pending=1000, outbox=None):

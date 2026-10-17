@@ -37,7 +37,8 @@ RUNTIME = BASE/'runtime'
 SESSION = RUNTIME/'session.json'
 MTX = BASE/'bin/mediamtx.exe'
 FFMPEG = BASE/'bin/ffmpeg_bin/ffmpeg.exe'
-CONFIG = {'full': BASE/'mediamtx.yml', 'lite': BASE/'mediamtx-lite.yml'}
+CONFIG = {'full': BASE/'mediamtx.yml', 'lite': BASE/'mediamtx-lite.yml',
+          'live': BASE/'mediamtx-live.yml'}
 READY_TIMEOUT = 30
 STOP_TIMEOUT = 30
 FORCE_TIMEOUT = 10
@@ -91,7 +92,7 @@ def config_for(mode, override=None):
     if override:
         path = Path(override)
         return path if path.is_absolute() else (BASE/path)
-    return CONFIG['lite' if mode == 'lite' else 'full']
+    return CONFIG.get(mode, CONFIG['full'])
 
 
 def rtsp_port(mode, override=None):
@@ -191,7 +192,10 @@ def wait_until(predicate, timeout):
 
 
 def check_assets(mode, override=None):
-    required = [MTX, FFMPEG, config_for(mode, override), BASE/'videos/camera1.mp4']
+    required = [MTX, FFMPEG, config_for(mode, override)]
+    if mode != 'live':
+        # live 模式采集本机摄像头，不需要模拟素材视频。
+        required.append(BASE/'videos/camera1.mp4')
     missing = [str(path) for path in required if not path.exists()]
     if missing:
         raise RuntimeError('缺少运行文件：' + '、'.join(missing))
@@ -355,7 +359,10 @@ def command_start(mode, config_path=None):
         # 因此以 session 身份校验 + 端口就绪作为成功判据。
         if current and port_open(port) and identity_problem(current) is None:
             print(f"模拟流已启动（模式 {mode}，PID {current.get('managerPid')}，RTSP 端口 {port}）")
-            print(f'  RTSP：rtsp://127.0.0.1:{port}/camera1 ~ camera18')
+            if mode == 'live':
+                print(f'  RTSP：rtsp://127.0.0.1:{port}/<本机摄像头路径>（在控制台“本机摄像头”面板查看）')
+            else:
+                print(f'  RTSP：rtsp://127.0.0.1:{port}/camera1 ~ camera18')
             print('  浏览器预览：http://127.0.0.1:8889/camera1')
             print('  在线流列表：http://127.0.0.1:9997/v3/paths/list')
             return 0
@@ -416,10 +423,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='矿山模拟流安全启停')
     sub = parser.add_subparsers(dest='command')
     start = sub.add_parser('start', help='启动模拟流')
-    start.add_argument('--mode', choices=('full', 'lite'), default='full')
+    start.add_argument('--mode', choices=('full', 'lite', 'live'), default='full')
     start.add_argument('--config', help='可选：使用指定 MediaMTX 配置（默认按模式选择）')
     run = sub.add_parser('run', help='内部常驻管理进程')
-    run.add_argument('--mode', choices=('full', 'lite'), default='full')
+    run.add_argument('--mode', choices=('full', 'lite', 'live'), default='full')
     run.add_argument('--config', help='内部使用：与 start 相同的配置覆盖')
     stop = sub.add_parser('stop', help='停止模拟流')
     stop.add_argument('--force', action='store_true', help='身份校验通过后强制终止无响应的管理进程')

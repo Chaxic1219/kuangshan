@@ -5,9 +5,22 @@
 
 ## 目录结构
 - `bin/mediamtx.exe` — 流媒体服务器（v1.21.0）
-- `bin/ffmpeg_bin/` — FFmpeg（负责把本地视频循环推成 RTSP 流）
+- `bin/ffmpeg_bin/` — FFmpeg（负责把本地视频循环推成 RTSP 流，或采集本机摄像头）
 - `mediamtx.yml` — 完整配置（18 路）；`mediamtx-lite.yml` — 精简配置（8 路）
+- `mediamtx-live.yml` — 本机摄像头模式配置（由控制台“本机摄像头接入”面板生成受管段）
 - `stream_control.py` — 安全启停入口：MediaMTX 与 FFmpeg 归入项目专属作业对象
+
+## 本机摄像头接入（live 模式）
+控制台“视频”页顶部面板可枚举本机摄像头并写入 `mediamtx-live.yml`（受管段，可重复增删，
+不覆盖手写 path）。启动：
+
+```powershell
+kstool\启动-本机摄像头.bat
+# 等价：python kstool\mediamtx\stream_control.py start --mode live
+```
+
+面板会给出 `rtsp://127.0.0.1:8554/livecamN`，填入“添加视频”即可进入现有分析链路。
+停止用 `kstool\停止.bat`（与模拟流共用 session，同一时刻只允许一组流服务）。
 
 ## 启动（推荐：一键脚本）
 解压到**任意位置**后，双击对应的 bat 即可，不用改任何路径。

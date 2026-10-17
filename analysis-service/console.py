@@ -19,9 +19,14 @@ import uuid
 from catalog import ROOT, Store, EVENTS, model_status, validate_camera, validate_source, atomic_json, identifier, MEDIA_ROOT, resolve_source
 from alerts import public_status
 from maintenance import BATCH_LIMIT, Maintenance
+import camera_source
 import process_scope
 
 VIDEO_TYPES = {'.mp4': 'video/mp4', '.webm': 'video/webm', '.ogg': 'video/ogg', '.mov': 'video/quicktime'}
+
+# 本机摄像头 RTSP 流由 stream_control.py 的 live 模式托管，这里只读取它的运行记录。
+STREAM_SESSION = ROOT.parent/'kstool'/'mediamtx'/'runtime'/'session.json'
+STREAM_CONTROL = ROOT.parent/'kstool'/'mediamtx'/'stream_control.py'
 
 # 每路视频一个进程并各自加载权重，并发数直接决定内存与 CPU 占用。
 # 超出上限时明确拒绝，而不是静默排队把机器拖垮。
@@ -728,6 +733,83 @@ class Controller:
             message = '已重新排队，下次启动分析后发送'
         return {'ok': changed > 0, 'retried': changed, 'running': running, 'message': message}
 
+    # ==================== 本机摄像头（dshow → RTSP） ====================
+
+    def camera_devices(self):
+        """枚举本机摄像头并返回当前映射与 live 流运行状态。"""
+        devices, error = camera_source.list_camera_devices(with_error=True)
+        mapping = camera_source.managed_paths(camera_source.live_config_path())
+        return {
+            'devices': devices,
+            'error': error,
+            'livePaths': [{'path': name, 'device': device,
+                           'url': camera_source.live_stream_url(name)}
+                          for name, device in sorted(mapping.items())],
+            'stream': self.live_stream_status(),
+        }
+
+    def live_stream_status(self):
+        session = read_json(STREAM_SESSION, {})
+        try:
+            pid = int((session or {}).get('managerPid') or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        running = bool(pid and process_scope.pid_alive(pid))
+        return {'running': running, 'mode': (session or {}).get('mode', ''), 'pid': pid or None}
+
+    def save_live_camera(self, device, path_name=''):
+        """把本机摄像头写入 live 配置；返回可直接填进视频配置的 RTSP 地址。"""
+        if not isinstance(device, str) or not device.strip():
+            raise ValueError('请选择摄像头设备')
+        devices, error = camera_source.list_camera_devices(with_error=True)
+        if error:
+            raise ValueError(error)
+        if device not in [item['name'] for item in devices if item['usable']]:
+            raise ValueError('该摄像头当前不可用，请刷新设备列表')
+        mapping = camera_source.managed_paths(camera_source.live_config_path())
+        path_name = (path_name or '').strip()
+        if not path_name:
+            index = 1
+            while 'livecam%d' % index in mapping:
+                index += 1
+            path_name = 'livecam%d' % index
+        config = camera_source.ensure_live_config()
+        added = camera_source.upsert_live_path(config, path_name, device)
+        return {'ok': True, 'path': path_name, 'device': device.strip(),
+                'url': camera_source.live_stream_url(path_name), 'added': added,
+                'stream': self.live_stream_status(),
+                'message': '已写入配置；启动或重启“本机摄像头流”后即可添加该地址'}
+
+    def remove_live_camera(self, path_name):
+        if not isinstance(path_name, str) or not camera_source.PATH_NAME.match(path_name):
+            raise ValueError('摄像头路径名无效')
+        removed = camera_source.remove_live_path(camera_source.live_config_path(), path_name)
+        if not removed:
+            raise ValueError('该摄像头路径不存在')
+        return {'ok': True, 'path': path_name, 'stream': self.live_stream_status(),
+                'message': '已移除；重启“本机摄像头流”后生效'}
+
+    def control_live_streams(self, action):
+        """启动/停止 live 模式 MediaMTX；复用 stream_control 的身份校验与作业对象。"""
+        if action not in ('start', 'stop'):
+            raise ValueError('操作无效')
+        if not STREAM_CONTROL.is_file():
+            raise ValueError('未找到 kstool/mediamtx/stream_control.py')
+        command = [sys.executable, str(STREAM_CONTROL)]
+        command += ['start', '--mode', 'live'] if action == 'start' else ['stop']
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+        try:
+            result = subprocess.run(
+                command, cwd=str(STREAM_CONTROL.parent), capture_output=True, text=True,
+                encoding='utf-8', errors='replace', timeout=150, creationflags=flags)
+        except subprocess.TimeoutExpired:
+            raise ValueError('操作超时，请查看 kstool\\mediamtx\\runtime\\manager.log') from None
+        output = ((result.stdout or '') + (result.stderr or '')).strip()
+        if result.returncode != 0:
+            raise ValueError(output or '操作失败（返回码 %d）' % result.returncode)
+        return {'ok': True, 'action': action, 'output': output,
+                'stream': self.live_stream_status()}
+
     def alerts_csv(self):
         """把事件记录导出为 CSV 文本（字段与页面事件表一致）。"""
         import csv
@@ -880,6 +962,8 @@ def make_handler(controller, token):
                 return self.reply(200, {**data, 'token': token})
             if route == '/api/samples':
                 return self.reply(200, controller.samples())
+            if route == '/api/cameras/devices':
+                return self.reply(200, controller.camera_devices())
             if route == '/api/alerts/outbox':
                 params = parse_qs(urlsplit(self.path).query)
                 camera_id = (params.get('cameraId') or [''])[0].strip()
@@ -952,6 +1036,13 @@ def make_handler(controller, token):
                     return self.reply(200, controller.retry_outbox(data.get('cameraId'), data.get('id')))
                 if self.path == '/api/maintenance/run':
                     return self.reply(200, controller._maintain())
+                if self.path == '/api/cameras/live':
+                    return self.reply(200, controller.save_live_camera(
+                        data.get('device'), data.get('path') or ''))
+                if self.path == '/api/cameras/live/remove':
+                    return self.reply(200, controller.remove_live_camera(data.get('path')))
+                if self.path == '/api/cameras/live/streams':
+                    return self.reply(200, controller.control_live_streams(data.get('action')))
                 with controller.lock:
                     if self.path == '/api/cameras/save':
                         return self.reply(200, {'camera': controller.save(data)})

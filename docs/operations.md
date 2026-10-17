@@ -52,6 +52,16 @@ python console.py --port 8766 --data D:\test  # 独立数据目录（可并行�
 | `capacity.storage=blocked` | 磁盘低于 1 GiB | 清理后人工重新启动分析 |
 | 告警 `dead` | 4xx/重定向/坏负载/证据缺失 | 页面人工重试或修复配置 |
 
+### 本机摄像头（USB/内置）
+
+- 控制台“视频”页顶部面板：枚举设备 → “接入” → “启动本机摄像头流” → 用面板给出的
+  `rtsp://127.0.0.1:8554/livecamN` 添加视频；命令行等价 `kstool\启动-本机摄像头.bat`。
+- 映射写入 `kstool/mediamtx/mediamtx-live.yml` 的受管段（起止标记包围，可重复增删，
+  不覆盖手写 path）。
+- 停止：`kstool\停止.bat`；同一时刻只允许一组流服务（模拟流与 live 模式共用 session）。
+- 排查：流未就绪时看 `kstool/mediamtx/runtime/<实例>/mediamtx.log`（停止后实例目录会被清理）；
+  摄像头被其他程序占用、分辨率不在支持列表、USB 带宽不足都会表现为 path 不 ready。
+
 ## 4. 告警队列
 
 - 状态：`pending`（等待/重试）、`dead`（人工处理）；超时/连接错误/429/5xx 保持 pending 退避。

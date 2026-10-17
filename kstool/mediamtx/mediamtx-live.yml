@@ -1,0 +1,30 @@
+# ============================================================
+# 本机摄像头模式（live）：USB/内置摄像头经 dshow 采集后推成 RTSP
+# 受管段由控制台“本机摄像头接入”面板维护，请勿手改标记之间的内容
+# 启动：kstool\启动-本机摄像头.bat（python stream_control.py start --mode live）
+# ============================================================
+logLevel: info
+
+# 管理API（http://127.0.0.1:9997/v3/paths/list 查看在线流）
+api: yes
+apiAddress: 127.0.0.1:9997
+
+# RTSP 服务（模拟摄像头输出）
+rtsp: yes
+rtspAddress: :8554
+
+# 浏览器预览：WebRTC（前端低延迟播放）+ HLS（备用）
+webrtc: yes
+webrtcAddress: :8889
+hls: yes
+hlsAddress: :8888
+hlsAllowOrigin: "*"
+
+# 关闭不需要的协议
+rtmp: no
+srt: no
+
+paths:
+
+# ---- live cameras (managed by camera_source.py) ----
+# ---- live cameras end ----

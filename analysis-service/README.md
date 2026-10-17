@@ -35,6 +35,24 @@
 冒烟测试真实校验检测链路：使用含井下人员的素材（`camera12.mp4`）验证人员与区域
 入侵、用 `camera5.mp4` 验证安全装备，并要求人员检出与入侵告警均大于 0 才算通过。
 
+## 本机摄像头接入（USB/内置）
+
+控制台“视频”页顶部有“本机摄像头接入”面板：
+
+1. 面板自动枚举本机 DirectShow 摄像头（`USB2.0 PC CAMERA`、内置摄像头、OBS/ToDesk 虚拟摄像头等）；
+2. 点“接入”把设备写入 `kstool/mediamtx/mediamtx-live.yml` 的受管段（重复接入同一设备会替换，
+   不影响手写 path），面板给出 `rtsp://127.0.0.1:8554/livecamN`；
+3. 点“启动本机摄像头流”（等价的命令是 `kstool\启动-本机摄像头.bat` 或
+   `python kstool\mediamtx\stream_control.py start --mode live`）；停止仍用 `kstool\停止.bat`；
+4. 在“添加视频”里填上面的 RTSP 地址，后续封面、检测、告警与普通 RTSP 流完全一致。
+
+采集由 FFmpeg 从 dshow 读取并转码（H.264、`ultrafast`、无 B 帧、`yuv420p`、低码率），
+推流进程由 MediaMTX 的 `runOnInit` 托管，启停与端口冲突检查复用 `stream_control.py` 的
+作业对象机制。分辨率默认跟随设备原生格式（不同 UVC 摄像头支持的分辨率不同，写死会失败）。
+
+限制：摄像头同一时刻只能被一个程序占用；多路 USB 摄像头建议分散到不同 USB 控制器；
+转码占用 CPU，6 路并发上限照常适用；虚拟摄像头接入的是虚拟内容，注意别选错设备。
+
 ## 告警上报（可选）
 
 配置环境变量后启用，未配置时仅本机展示、不对外发送：
@@ -117,6 +135,7 @@ python acceptance.py --minutes 480             # 8 小时稳定性（固定机�
 
 ## 主要文件
 
+- `camera_source.py` 本机摄像头接入（dshow 设备枚举、live 配置生成、受管段增删）
 - `maintenance.py` 可再生运行文件清理（预览/执行、引用保护、低空间检测）
 - `evaluate_accuracy.py` 离线准确率测量（标注模板、漏报/误报统计，不判定合格）
 - `catalog.py` 视频配置、场景与模型目录
