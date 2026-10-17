@@ -235,6 +235,37 @@ class MaintenanceTests(unittest.TestCase):
             except OSError:
                 pass
 
+    def test_outbox_media_under_junction_is_not_deleted(self):
+        outside = self.work/'outside-media'
+        outside.mkdir()
+        victim = outside/'victim.jpg'
+        victim.write_bytes(b'victim')
+        old(victim, 2 * DAY)
+        camera_dir = self.work/'outbox'/'A'
+        camera_dir.mkdir(parents=True)
+        with closing(sqlite3.connect(camera_dir/'outbox.db')) as db, db:
+            db.execute('CREATE TABLE outbox (id TEXT, state TEXT, snapshot TEXT)')
+        media = camera_dir/'media'
+        created = subprocess.run(
+            ['cmd', '/c', 'mklink', '/J', str(media), str(outside)],
+            capture_output=True, text=True)
+        if created.returncode != 0:
+            self.skipTest('当前环境无法创建 junction')
+        try:
+            report = self.maintenance.plan()
+            self.assertIn('victim.jpg',
+                          {Path(item['path']).name for item in report['candidates']})
+            result = self.maintenance.execute()
+            self.assertTrue(victim.exists(), 'outbox 截图目录是 junction 时不得删除外部文件')
+            skipped = (result.get('outbox') or {}).get('skipped') or []
+            self.assertTrue(skipped, '应记录跳过原因而不是删除')
+            self.assertTrue(any('拒绝删除' in item.get('reason', '') for item in skipped))
+        finally:
+            try:
+                media.rmdir()
+            except OSError:
+                pass
+
     def test_delete_rejects_path_outside_root(self):
         outside = self.work/'outside.txt'
         outside.write_text('x', encoding='utf-8')

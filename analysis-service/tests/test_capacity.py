@@ -310,5 +310,41 @@ class CapacityTests(unittest.TestCase):
         self.assertIn('maintenance', state['capacity'])
 
 
+    # ---------- 旧回收与新任务隔离（审查问题 2） ----------
+
+    def test_start_uses_new_generation_after_stop(self):
+        cid = self.add('代次唯一')['id']
+        self.c.start(cid)
+        first_generation = self.c.jobs[cid]['generation']
+        self.c.stop(cid)
+        self.c.start(cid)
+        second_generation = self.c.jobs[cid]['generation']
+        self.assertGreater(second_generation, first_generation,
+                           '人工重启不得复用旧任务的 generation')
+
+    def test_start_refused_while_previous_instance_stopping(self):
+        cid = self.add('回收中')['id']
+        self.c.start(cid)
+        job = self.c.jobs[cid]
+        job['lifecycle'] = 'stopping'
+        with self.assertRaises(ValueError) as ctx:
+            self.c.start(cid)
+        self.assertIn('回收', str(ctx.exception))
+        self.assertIs(self.c.jobs[cid], job, '回收未确认前不得创建替代实例')
+
+    def test_stale_fail_callback_does_not_override_new_job(self):
+        cid = self.add('旧回收')['id']
+        old = self.c._new_job(self.c.work/'runtime'/'old')
+        old['generation'] = 1
+        new = self.c._new_job(self.c.work/'runtime'/'new')
+        new['generation'] = 1  # 模拟修复前 generation 复用；身份校验必须阻止
+        new['desiredRunning'] = True
+        new['lifecycle'] = 'active'
+        self.c.jobs[cid] = new
+        self.c._fail(cid, 1, '旧回收', expected_job=old)
+        self.assertEqual(new['lifecycle'], 'active')
+        self.assertTrue(new['desiredRunning'])
+
+
 if __name__ == '__main__':
     unittest.main()

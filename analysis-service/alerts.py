@@ -385,6 +385,32 @@ class AlertReporter:
                 self.message = '本地告警队列暂时不可用，稍后重试'
             self.stop.wait(2)
 
+    @staticmethod
+    def _payload_problem(data):
+        """负载必需字段与类型校验；结构错误应标记 dead，不能进入无限重试。"""
+        if not isinstance(data, dict):
+            return '负载结构不合法'
+        record = data.get('record')
+        detection = data.get('detection')
+        if not isinstance(record, dict) or not isinstance(detection, dict):
+            return '负载缺少必要字段'
+        if not isinstance(data.get('snapshot'), str) or not data.get('snapshot'):
+            return '负载缺少必要字段'
+        if not isinstance(data.get('alertCode'), str) or not data.get('alertCode'):
+            return '负载缺少必要字段'
+        index = data.get('index')
+        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+            return '负载缺少必要字段'
+        summary = record.get('summary')
+        if summary is not None and not isinstance(summary, str):
+            return '负载字段类型错误'
+        if not isinstance(detection.get('label'), str) or not detection.get('label'):
+            return '负载缺少必要字段'
+        confidence = detection.get('confidence')
+        if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+            return '负载字段类型错误'
+        return ''
+
     def _claim(self):
         """取出一条到期 pending 记录并占用（attempts 自增）；坏负载标记 dead。"""
         with closing(sqlite3.connect(self.database, timeout=10)) as db, db:
@@ -395,16 +421,19 @@ class AlertReporter:
             if not row:
                 return None
             try:
-                data = json.loads(row[1])
-            except ValueError:
+                data = json.loads(row[1]) if row[1] is not None else None
+            except (TypeError, ValueError):
+                data = None
+            if data is None:
                 db.execute(
                     "UPDATE outbox SET state='dead', last_error=?, updated_at=? WHERE id=?",
                     ('负载无法解析，已保留原始记录', time.time(), row[0]))
                 return None
-            if not isinstance(data, dict):
+            problem = self._payload_problem(data)
+            if problem:
                 db.execute(
                     "UPDATE outbox SET state='dead', last_error=?, updated_at=? WHERE id=?",
-                    ('负载结构不合法，已保留原始记录', time.time(), row[0]))
+                    (problem + '，已保留原始记录', time.time(), row[0]))
                 return None
             db.execute('UPDATE outbox SET attempts=attempts+1 WHERE id=?', (row[0],))
         return {'id': row[0], **data, 'attempts': row[2] + 1}

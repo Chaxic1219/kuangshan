@@ -346,13 +346,35 @@ class Maintenance:
             report['outbox'] = self._delete_outbox_media(outbox_media)
         return report
 
+    def _outbox_media_safe(self, file, camera_dir):
+        """outbox 截图删除边界：根目录、摄像头目录与祖先重解析点。"""
+        try:
+            outbox_root = self.outbox.resolve()
+            camera_resolved = camera_dir.resolve()
+            file_resolved = file.resolve()
+        except OSError:
+            return False, '路径无法解析，拒绝删除'
+        if not camera_resolved.is_relative_to(outbox_root):
+            return False, '截图目录不在 outbox 根内，拒绝删除'
+        if not file_resolved.is_relative_to(camera_resolved):
+            return False, '截图不在对应摄像头目录内，拒绝删除'
+        for path in (camera_dir, file.parent, file):
+            if _is_reparse(path):
+                return False, '符号链接或 junction，拒绝删除'
+        return True, ''
+
     def _delete_outbox_media(self, items):
-        """按摄像头在 BEGIN IMMEDIATE 事务内重新检查引用后删除。"""
+        """按摄像头在 BEGIN IMMEDIATE 事务内重新检查引用与删除边界后删除。"""
         result = {'deleted': [], 'skipped': [], 'errors': []}
         grouped = {}
         for item in items:
             grouped.setdefault(Path(item['path']).parent.parent, []).append(Path(item['path']))
         for camera_dir, files in grouped.items():
+            # 打开数据库前先验证目录边界，避免 junction 指向外部队列或文件系统。
+            safe, reason = self._outbox_media_safe(files[0], camera_dir)
+            if not safe:
+                result['skipped'].extend({'path': str(file), 'reason': reason} for file in files)
+                continue
             db = camera_dir/'outbox.db'
             try:
                 with closing(sqlite3.connect(db, timeout=2)) as conn:
@@ -360,6 +382,10 @@ class Maintenance:
                     refs = {Path(row[0]).resolve() for row in conn.execute(
                         'SELECT snapshot FROM outbox').fetchall() if row[0]}
                     for file in files:
+                        safe, reason = self._outbox_media_safe(file, camera_dir)
+                        if not safe:
+                            result['skipped'].append({'path': str(file), 'reason': reason})
+                            continue
                         if file.resolve() in refs:
                             result['skipped'].append({'path': str(file), 'reason': '清理期间出现引用'})
                             continue

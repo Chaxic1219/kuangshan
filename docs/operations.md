@@ -86,8 +86,9 @@ python maintenance.py --work data --runs runs --execute  # 执行删除（有界
 ## 7. 验收与准确率
 
 ```powershell
-python acceptance.py --minutes 2        # 短时：6 路含模拟流、至少 4 路分析
-python acceptance.py --minutes 480      # 8 小时稳定性（固定机器）
+python acceptance.py --minutes 2              # 短时：默认 6 路分析（含 2 路模拟流）
+python acceptance.py --minutes 2 --analyze 4  # 低配机器可减少分析路数
+python acceptance.py --minutes 480            # 8 小时稳定性（固定机器）
 python evaluate_accuracy.py template --video kstool/mediamtx/videos/camera5.mp4 --out dataset
 python evaluate_accuracy.py evaluate --model ppe --images dataset/images --annotations dataset/labels.jsonl
 ```

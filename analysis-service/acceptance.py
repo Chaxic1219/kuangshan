@@ -163,6 +163,43 @@ def percentile(values, ratio):
     return round(ordered[index], 3)
 
 
+def summarize_result_ages(samples):
+    """按路与整体统计结果年龄，避免合并 P95 掩盖单路性能问题。"""
+    per_camera = {}
+    all_ages = []
+    for sample in samples:
+        for camera_id, ages in (sample.get('agesByCamera') or {}).items():
+            per_camera.setdefault(camera_id, []).extend(ages)
+            all_ages.extend(ages)
+
+    def stats(values):
+        return {'samples': len(values), 'p50': percentile(values, 0.5),
+                'p95': percentile(values, 0.95),
+                'max': round(max(values), 3) if values else None}
+
+    return {'overall': stats(all_ages),
+            'perCamera': {cid: stats(values) for cid, values in sorted(per_camera.items())}}
+
+
+def summarize_camera_ages(samples, camera_ids):
+    """逐路结果年龄（包含未产出结果的相机），避免总体 P95 掩盖单路问题。"""
+    per_camera = {cid: [] for cid in camera_ids}
+    for sample in samples:
+        for camera_id, ages in (sample.get('agesByCamera') or {}).items():
+            per_camera.setdefault(camera_id, []).extend(ages)
+    result = {}
+    for camera_id, ages in per_camera.items():
+        p95 = percentile(ages, 0.95)
+        result[camera_id] = {
+            'samples': len(ages),
+            'p50': percentile(ages, 0.5),
+            'p95': p95,
+            'max': round(max(ages), 3) if ages else None,
+            'within3s': p95 is not None and p95 <= 3,
+        }
+    return result
+
+
 def collect_events(work):
     errors = []
     for path in Path(work).rglob('events.jsonl'):
@@ -226,10 +263,11 @@ def run(args):
         while time.monotonic() < deadline:
             time.sleep(args.interval)
             state = http_json(base, '/api/state')
-            ages = []
+            ages_by_camera = {}
             lifecycles = {}
             for camera in state['cameras']:
                 lifecycles[camera['id']] = camera.get('lifecycle')
+                ages = ages_by_camera.setdefault(camera['id'], [])
                 for record in (camera.get('latest') or {}).values():
                     captured = record.get('capturedAt')
                     if captured:
@@ -240,7 +278,7 @@ def run(args):
                             continue
             samples.append({
                 'at': iso_now(),
-                'ages': ages,
+                'agesByCamera': ages_by_camera,
                 'lifecycles': lifecycles,
                 'capacity': state.get('capacity'),
                 'bridge': state.get('alertBridge'),
@@ -248,9 +286,10 @@ def run(args):
                                 for camera in state['cameras'] if camera.get('modelErrors')},
             })
 
-        all_ages = [age for sample in samples for age in sample['ages']]
-        p95 = percentile(all_ages, 0.95)
-        max_age = round(max(all_ages), 3) if all_ages else None
+        summary = summarize_result_ages(samples)
+        overall = summary['overall']
+        per_camera = summarize_camera_ages(samples, ids)
+        p95 = overall['p95']
         final_state = http_json(base, '/api/state')
         capacity = final_state.get('capacity') or {}
         bridge = final_state.get('alertBridge') or {}
@@ -271,7 +310,8 @@ def run(args):
                 'tasks': ['person'], 'interval': 1, 'confidence': 0.4,
             },
             'samples': len(samples),
-            'resultAgeSeconds': {'p50': percentile(all_ages, 0.5), 'p95': p95, 'max': max_age},
+            'resultAgeSeconds': overall,
+            'resultAgeSecondsByCamera': per_camera,
             'lifecycles': lifecycles,
             'modelErrors': {camera['id']: camera.get('modelErrors')
                             for camera in final_state['cameras'] if camera.get('modelErrors')},
@@ -289,6 +329,8 @@ def run(args):
                 'resultAgeP95Within3s': (p95 is not None and p95 <= 3),
                 'allAnalyzedActive': lifecycles.get('active') == args.analyze,
                 'streamsUsed': bool(rtsp_port),
+                'camerasOver3s': [cid for cid, item in per_camera.items()
+                                  if not item.get('within3s')],
             },
             'limitations': [
                 '性能指标为测量值，不代表所有硬件/素材组合；P95 超过 3 秒时应降低并发或增大任务间隔并记录配置。',
@@ -347,10 +389,18 @@ def write_markdown(report, path):
         '- 配置：%d 路视频、%d 路分析、模拟流=%s' % (
             config['camerasConfigured'], config['camerasAnalyzed'], config['streams']),
         '', '## 测量结果', '',
-        '- 结果年龄 P50/P95/Max：%s / %s / %s 秒' % (
+        '- 结果年龄总体 P50/P95/Max：%s / %s / %s 秒' % (
             report['resultAgeSeconds']['p50'], report['resultAgeSeconds']['p95'],
             report['resultAgeSeconds']['max']),
-        '- 生命周期分布：%s' % report['lifecycles'],
+        '', '### 逐路结果年龄', '',
+        '| 视频 | P50 | P95 | Max | 样本 | 3秒内 |', '|---|---|---|---|---|---|',
+    ]
+    for camera_id, item in sorted((report.get('resultAgeSecondsByCamera') or {}).items()):
+        lines.append('| %s | %s | %s | %s | %s | %s |' % (
+            camera_id, item.get('p50'), item.get('p95'), item.get('max'),
+            item.get('samples'), item.get('within3s')))
+    lines += [
+        '', '- 生命周期分布：%s' % report['lifecycles'],
         '- 模型错误：%s' % report['modelErrors'],
         '- 告警桥：%s' % report['alertBridge'].get('detail'),
         '- 资源：CPU %s%%，内存 %s MB，磁盘 %s' % (
@@ -370,7 +420,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='联合验收（短时/长时）')
     parser.add_argument('--minutes', type=float, default=2)
     parser.add_argument('--cameras', type=int, default=6)
-    parser.add_argument('--analyze', type=int, default=4)
+    parser.add_argument('--analyze', type=int, default=6)
     parser.add_argument('--interval', type=float, default=2)
     parser.add_argument('--no-streams', action='store_true')
     parser.add_argument('--keep-data', action='store_true')

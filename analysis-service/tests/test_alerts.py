@@ -274,6 +274,18 @@ class AlertBridgeTests(unittest.TestCase):
 
     # ---------- 发送线程健壮性 ----------
 
+    def test_structurally_invalid_payload_marks_dead(self):
+        reporter = self.reporter(FailingOpener())
+        with closing(sqlite3.connect(reporter.database)) as db, db:
+            db.execute(
+                "INSERT INTO outbox (id, alert_code, payload, snapshot, attempts, next_at, state) "
+                "VALUES (?,?,?,?,0,0,'pending')",
+                ('struct-0', 'CODE', '{}', str(self.snapshot)))
+        self.assertTrue(self.wait_counts(reporter, pending=0, dead=1))
+        rows = self.rows(reporter)
+        self.assertIn('负载', rows[0][2])
+        self.assertTrue(reporter.worker.is_alive(), '结构错误不得使发送线程退出或无限重试')
+
     def test_sqlite_error_keeps_worker_alive(self):
         reporter = self.reporter(FailingOpener(fail_times=0))
         original = reporter._claim

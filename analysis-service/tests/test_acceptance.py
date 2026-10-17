@@ -28,5 +28,20 @@ class AcceptanceHelperTests(unittest.TestCase):
                     self.assertIn('%s: 127.0.0.1:' % key, text)
 
 
+    def test_summarize_result_ages_per_camera(self):
+        samples = [
+            {'agesByCamera': {'a': [1.0, 3.0], 'b': [5.0]}},
+            {'agesByCamera': {'a': [2.0], 'b': [7.0]}},
+        ]
+        summary = acceptance.summarize_result_ages(samples)
+        self.assertEqual(summary['overall']['p50'], 3.0)
+        self.assertEqual(summary['overall']['p95'], 7.0)
+        self.assertEqual(summary['overall']['max'], 7.0)
+        self.assertEqual(summary['perCamera']['a']['p50'], 2.0)
+        self.assertEqual(summary['perCamera']['a']['p95'], 3.0)
+        self.assertEqual(summary['perCamera']['b']['max'], 7.0)
+        self.assertEqual(summary['perCamera']['b']['samples'], 2)
+
+
 if __name__ == '__main__':
     unittest.main()

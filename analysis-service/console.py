@@ -69,6 +69,7 @@ class Controller:
         self.jobs = {}
         self.probes = {}
         self.scope_factory = scope_factory or process_scope.ProcessScope
+        self._generation = 0
         self._mutex = None
         if scope_factory is None and process_scope.IS_WINDOWS:
             name = 'Local\\kuangshan-analysis-' + hashlib.sha256(
@@ -132,7 +133,7 @@ class Controller:
                 job['desiredRunning'] = False
                 job['nextRestartMonotonic'] = None
                 job['restartHistory'] = []
-            self._fail(cid, generation, '存储空间不足，分析已停止')
+            self._fail(cid, generation, '存储空间不足，分析已停止', expected_job=job)
 
     def _maintain(self):
         active = self._active_run_dirs()
@@ -154,7 +155,8 @@ class Controller:
     def _new_job(folder):
         return {
             'scope': None, 'folder': Path(folder), 'desiredRunning': False,
-            'generation': 0, 'lifecycle': 'stopped',
+            'token': uuid.uuid4().hex,
+            'generation': 0, 'lifecycle': 'stopped', 'reclaiming': False,
             'startedMonotonic': 0.0, 'lastProgressMonotonic': 0.0,
             'lastHeartbeatSeq': 0, 'restartHistory': [],
             'lastRestartMonotonic': 0.0, 'nextRestartMonotonic': None,
@@ -194,11 +196,11 @@ class Controller:
                 if lifecycle == 'starting' and scope is None:
                     # 进程创建尚未完成：只检查初始化期限。
                     if now - started > INITIAL_TIMEOUT_SECONDS:
-                        self._fail(cid, generation, '初始化超时')
+                        self._fail(cid, generation, '初始化超时', expected_job=job)
                     continue
             if scope is not None and lifecycle in ('starting', 'active') and not scope.main_alive():
                 # 服务主进程退出时，派生的分析进程可能仍在写心跳；仍按意外退出处理。
-                self._fail(cid, generation, '服务进程退出')
+                self._fail(cid, generation, '服务进程退出', expected_job=job)
                 continue
             seq = self._heartbeat_seq(cid)
             active = scope.active_process_count() if scope else 0
@@ -211,9 +213,9 @@ class Controller:
                             job['lastProgressMonotonic'] = now
                             job['lastRestartMonotonic'] = now
                 elif active == 0:
-                    self._fail(cid, generation, '初始化前退出')
+                    self._fail(cid, generation, '初始化前退出', expected_job=job)
                 elif now - started > INITIAL_TIMEOUT_SECONDS:
-                    self._fail(cid, generation, '初始化超时')
+                    self._fail(cid, generation, '初始化超时', expected_job=job)
             elif lifecycle == 'active':
                 if seq > last_seq:
                     with self.lock:
@@ -221,22 +223,25 @@ class Controller:
                             job['lastHeartbeatSeq'] = seq
                             job['lastProgressMonotonic'] = now
                 if active == 0:
-                    self._fail(cid, generation, '意外退出')
+                    self._fail(cid, generation, '意外退出', expected_job=job)
                 elif now - last_progress > WATCHDOG_SECONDS:
-                    self._fail(cid, generation, '执行超时')
+                    self._fail(cid, generation, '执行超时', expected_job=job)
                 elif job['restartHistory'] and now - job['lastRestartMonotonic'] > STABLE_RESET_SECONDS:
                     with self.lock:
                         if self._lifecycle_is(cid, generation, 'active'):
                             job['restartHistory'] = []
             elif lifecycle == 'backoff':
                 if not desired:
-                    self._fail(cid, generation, job['lastFailure'] or '已停止', recover_only=True)
+                    self._fail(cid, generation, job['lastFailure'] or '已停止', recover_only=True,
+                               expected_job=job)
                 elif job['nextRestartMonotonic'] and now >= job['nextRestartMonotonic']:
-                    self._restart(cid, generation)
+                    self._restart(cid, generation, expected_job=job)
             elif lifecycle == 'stopping':
                 if active == 0:
                     with self.lock:
                         if self._lifecycle_is(cid, generation, 'stopping'):
+                            if job.get('reclaiming'):
+                                continue
                             if job['scope']:
                                 job['scope'].close()
                             job['scope'] = None
@@ -252,15 +257,23 @@ class Controller:
         except (TypeError, ValueError):
             return 0
 
-    def _fail(self, cid, generation, reason, recover_only=False):
-        """回收失败的作业代数；确认归零后按预算安排恢复，否则进入 failed。"""
+    def _fail(self, cid, generation, reason, recover_only=False, expected_job=None):
+        """回收失败的作业代数；确认归零后按预算安排恢复，否则进入 failed。
+
+        expected_job 用于身份校验：旧回收即使在等待期间被新任务替换，
+        也不得改写新任务的状态。
+        """
         now = time.monotonic()
         with self.lock:
             job = self.jobs.get(cid)
             if not job or job['generation'] != generation:
                 return
+            if expected_job is not None and job is not expected_job:
+                return
+            token = job['token']
             scope = job['scope']
             job['scope'] = None
+            job['reclaiming'] = True
             job['lastFailure'] = reason
             if not recover_only:
                 job['restartHistory'].append(now)
@@ -271,40 +284,44 @@ class Controller:
             recovered = scope.wait_for_zero(STOP_CONFIRM_SECONDS)
             scope.close()
         with self.lock:
-            job = self.jobs.get(cid)
-            if not job or job['generation'] != generation:
+            current = self.jobs.get(cid)
+            if current is not job or current['token'] != token or current['generation'] != generation:
                 return
+            current['reclaiming'] = False
             if not recovered:
-                job['lifecycle'] = 'failed'
-                job['desiredRunning'] = False
-                job['lastFailure'] = reason + '（回收无法确认）'
-                job['nextRestartMonotonic'] = None
+                current['lifecycle'] = 'failed'
+                current['desiredRunning'] = False
+                current['lastFailure'] = reason + '（回收无法确认）'
+                current['nextRestartMonotonic'] = None
                 return
-            if not job['desiredRunning'] or recover_only:
-                job['lifecycle'] = 'stopped'
-                job['nextRestartMonotonic'] = None
+            if not current['desiredRunning'] or recover_only:
+                current['lifecycle'] = 'stopped'
+                current['nextRestartMonotonic'] = None
                 return
-            recent = [t for t in job['restartHistory'] if now - t <= RESTART_WINDOW_SECONDS]
-            job['restartHistory'] = recent
+            recent = [t for t in current['restartHistory'] if now - t <= RESTART_WINDOW_SECONDS]
+            current['restartHistory'] = recent
             if len(recent) > RESTART_LIMIT:
-                job['lifecycle'] = 'failed'
-                job['desiredRunning'] = False
-                job['lastFailure'] = reason + '（自动重启次数已达上限）'
-                job['nextRestartMonotonic'] = None
+                current['lifecycle'] = 'failed'
+                current['desiredRunning'] = False
+                current['lastFailure'] = reason + '（自动重启次数已达上限）'
+                current['nextRestartMonotonic'] = None
                 return
             delay = RESTART_BACKOFF[min(len(recent) - 1, len(RESTART_BACKOFF) - 1)]
-            job['lifecycle'] = 'backoff'
-            job['nextRestartMonotonic'] = time.monotonic() + delay
+            current['lifecycle'] = 'backoff'
+            current['nextRestartMonotonic'] = time.monotonic() + delay
 
-    def _restart(self, cid, generation):
+    def _restart(self, cid, generation, expected_job=None):
         with self.lock:
             job = self.jobs.get(cid)
             if not job or job['generation'] != generation or job['lifecycle'] != 'backoff':
                 return
+            if expected_job is not None and job is not expected_job:
+                return
             if not job['desiredRunning']:
                 job['lifecycle'] = 'stopped'
                 return
-            job['generation'] += 1
+            self._generation += 1
+            job['generation'] = self._generation
             new_generation = job['generation']
             job['lifecycle'] = 'starting'
             job['startedMonotonic'] = time.monotonic()
@@ -314,11 +331,11 @@ class Controller:
             job['lastFailure'] = ''
             folder = job['folder']
             config_path = folder/'config.json'
-        self._spawn(cid, new_generation, config_path, folder)
+        self._spawn(cid, new_generation, config_path, folder, expected_job=job)
 
     # ==================== 进程创建 ====================
 
-    def _spawn(self, cid, generation, config_path, folder):
+    def _spawn(self, cid, generation, config_path, folder, expected_job=None):
         command = [sys.executable, str(ROOT/'service.py'), '--config', str(config_path),
                    '--output', str(folder), '--duration', '0']
         log = folder/'service.log'
@@ -327,15 +344,17 @@ class Controller:
         except Exception as exc:
             with self.lock:
                 job = self.jobs.get(cid)
-                if job and job['generation'] == generation:
+                if job and job['generation'] == generation and (
+                        expected_job is None or job is expected_job):
                     job['lifecycle'] = 'failed'
                     job['desiredRunning'] = False
                     job['lastFailure'] = f'启动失败：{exc}'
             raise ValueError('启动分析失败，请查看服务日志') from exc
         with self.lock:
             job = self.jobs.get(cid)
-            if not job or job['generation'] != generation or not job['desiredRunning']:
-                # 启动期间用户取消或已被新代次取代：回收本次作业。
+            if (not job or job['generation'] != generation or not job['desiredRunning']
+                    or (expected_job is not None and job is not expected_job)):
+                # 启动期间用户取消或已被新任务取代：回收本次作业。
                 scope.terminate()
                 scope.wait_for_zero(STOP_CONFIRM_SECONDS)
                 scope.close()
@@ -410,6 +429,8 @@ class Controller:
             raise ValueError('磁盘剩余空间不足 1 GiB，请清理后重新启动分析')
         with self.lock:
             job = self.jobs.get(cid)
+            if job and job['lifecycle'] == 'stopping':
+                raise ValueError('上一实例正在回收，请稍后重试')
             if job and job['desiredRunning'] and job['lifecycle'] in LIFECYCLE_ADMITTED:
                 return
             if self._admitted_locked() >= MAX_RUNNING:
@@ -421,7 +442,8 @@ class Controller:
             job = self._new_job(folder)
             self.jobs[cid] = job
             job['desiredRunning'] = True
-            job['generation'] += 1
+            self._generation += 1
+            job['generation'] = self._generation
             job['lifecycle'] = 'starting'
             job['startedMonotonic'] = time.monotonic()
             job['lastProgressMonotonic'] = time.monotonic()
@@ -430,7 +452,7 @@ class Controller:
             job['restartHistory'] = []
             job['nextRestartMonotonic'] = None
             generation = job['generation']
-        self._spawn(cid, generation, config, folder)
+        self._spawn(cid, generation, config, folder, expected_job=job)
 
     def run_dir(self, cid):
         job = self.jobs.get(cid)
@@ -455,6 +477,7 @@ class Controller:
             job = self.jobs.get(cid)
             if not job:
                 return
+            target = job
             job['desiredRunning'] = False
             job['nextRestartMonotonic'] = None
             job['restartHistory'] = []
@@ -464,6 +487,7 @@ class Controller:
             job['lifecycle'] = 'stopping'
             generation = job['generation']
             scope = job['scope']
+            reclaiming = bool(job.get('reclaiming'))
         if scope and scope.active_process_count() > 0:
             run = self.run_dir(cid)
             deadline = time.monotonic() + 6
@@ -482,17 +506,20 @@ class Controller:
                 zero = scope.wait_for_zero(STOP_CONFIRM_SECONDS)
             scope.close()
         with self.lock:
-            job = self.jobs.get(cid)
-            if not job or job['generation'] != generation:
+            current = self.jobs.get(cid)
+            if current is not target or current['generation'] != generation:
                 return
-            job['scope'] = None
+            if reclaiming and current.get('reclaiming'):
+                # 旧回收线程尚未确认归零：保持 stopping，start 必须拒绝。
+                return
+            current['scope'] = None
             if zero:
-                job['lifecycle'] = 'stopped'
-                job['lastFailure'] = ''
+                current['lifecycle'] = 'stopped'
+                current['lastFailure'] = ''
             else:
-                job['lifecycle'] = 'failed'
-                job['desiredRunning'] = False
-                job['lastFailure'] = '回收无法确认'
+                current['lifecycle'] = 'failed'
+                current['desiredRunning'] = False
+                current['lastFailure'] = '回收无法确认'
 
     def delete(self, cid):
         if not self.store.get(cid):

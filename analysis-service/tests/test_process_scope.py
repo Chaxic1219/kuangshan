@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import process_scope
 
@@ -109,6 +110,24 @@ class ProcessScopeTests(unittest.TestCase):
             first.close()
         second = process_scope.SingleInstance(name)
         second.close()
+
+
+    def test_assign_failure_reaps_suspended_process(self):
+        """加入作业失败时，挂起创建的进程必须被直接终止，不能留下孤儿。"""
+        seen = {}
+
+        def failing_assign(scope, job, process):
+            seen['pid'] = scope.pid
+            raise OSError(5, '进程加入作业失败')
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            with patch.object(process_scope.ProcessScope, '_assign', failing_assign):
+                with self.assertRaises(OSError):
+                    process_scope.ProcessScope(
+                        [PYTHON, '-c', SLEEP], Path(tmp) / 'a.log', cwd=ROOT)
+        self.assertTrue(seen.get('pid'), '应已创建挂起进程')
+        self.assertFalse(process_scope.pid_alive(seen['pid']),
+                         '加入作业失败后挂起进程必须被回收')
 
 
 if __name__ == '__main__':

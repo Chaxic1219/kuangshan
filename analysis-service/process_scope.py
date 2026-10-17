@@ -147,6 +147,8 @@ if IS_WINDOWS:
     kernel32.ResumeThread.restype = wintypes.DWORD
     kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
     kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
     kernel32.CreateFileW.argtypes = [
@@ -231,8 +233,7 @@ class ProcessScope:
             self._thread = info.hThread
             self.pid = int(info.dwProcessId)
             try:
-                if not kernel32.AssignProcessToJobObject(job, info.hProcess):
-                    raise OSError(ctypes.get_last_error(), '进程加入作业失败')
+                self._assign(job, info.hProcess)
                 if kernel32.ResumeThread(info.hThread) == 0xFFFFFFFF:
                     raise OSError(ctypes.get_last_error(), '恢复分析进程失败')
             except OSError:
@@ -252,12 +253,18 @@ class ProcessScope:
                 self._abort_creation()
             raise
 
+    def _assign(self, job, process):
+        """把进程加入作业；失败由调用方回收已创建的挂起进程。"""
+        if not kernel32.AssignProcessToJobObject(job, process):
+            raise OSError(ctypes.get_last_error(), '进程加入作业失败')
+
     def _abort_creation(self):
-        """创建中途失败：终止挂起/已恢复进程并关闭句柄。"""
+        """创建中途失败：进程可能尚未加入作业，必须先直接终止再清理作业。"""
+        if self._process:
+            kernel32.TerminateProcess(self._process, 1)
+            kernel32.WaitForSingleObject(self._process, 2000)
         if self._job:
             kernel32.TerminateJobObject(self._job, 1)
-        elif self._process:
-            kernel32.TerminateProcess(self._process, 1)
         for name in ('_thread', '_process'):
             handle = getattr(self, name)
             if handle:
