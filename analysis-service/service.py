@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import threading
 import time
+import traceback
 import uuid
 
 import av
@@ -20,7 +21,7 @@ from stream_infer.inference import Inference
 from stream_infer.model import Mode
 from stream_infer.log import logger
 
-from catalog import EVENTS, validate_camera, number, atomic_json, resolve_source
+from catalog import EVENTS, validate_camera, number, atomic_json, resolve_source, replace_atomic
 from detectors import ModelPool, SceneAlgo
 from regions import EntryState, contains
 from alerts import AlertReporter
@@ -36,7 +37,7 @@ def write_atomic(path, data):
     path = Path(path)
     temp = path.with_name(path.name + '.tmp')
     temp.write_bytes(data)
-    temp.replace(path)
+    replace_atomic(temp, path)
 
 
 def validate_config(data):
@@ -387,6 +388,7 @@ def camera_worker(camera, output, run_id, stop):
                     'live': (Path(camera['id']) / 'live.jpg').as_posix() if (engine.directory / 'live.jpg').is_file() else ''})
                 heartbeat = time.monotonic()
     except Exception:
+        traceback.print_exc()
         engine.event('worker_error')
         raise SystemExit(1)
     finally:

@@ -5,6 +5,7 @@ import math
 import os
 from pathlib import Path
 import re
+import time
 from urllib.parse import urlsplit
 import uuid
 from regions import validate_polygon
@@ -134,11 +135,23 @@ def validate_camera(data):
     return result
 
 
+def replace_atomic(temp, path):
+    """Windows 读者短暂占用目标文件时有限重试，仍保持原子替换。"""
+    for attempt in range(6):
+        try:
+            temp.replace(path)
+            return
+        except PermissionError:
+            if attempt == 5:
+                raise
+            time.sleep(.01 * 2 ** attempt)
+
+
 def atomic_json(path, data):
     path = Path(path)
     temp = path.with_suffix('.tmp')
     temp.write_text(json.dumps(data, ensure_ascii=False, allow_nan=False, indent=2), encoding='utf-8')
-    temp.replace(path)
+    replace_atomic(temp, path)
 
 
 def model_status():

@@ -72,6 +72,69 @@ class LiveCameraApiTests(unittest.TestCase):
         self.assertFalse(data['stream']['running'])
         self.assertEqual(data['error'], '')
 
+    def test_prepare_uses_normal_probe_without_saving_camera(self):
+        with patch.object(self.controller, 'control_live_streams') as start, \
+                patch.object(camera_source, 'wait_live_ready', return_value=True), \
+                patch.object(self.controller, 'probe', return_value={
+                    'coverToken': 'preview', 'cover': '/covers/preview.jpg'}) as probe:
+            status, data = self.request('POST', '/api/cameras/live/prepare',
+                                        {'deviceId': 'USB Camera A'})
+        self.assertEqual(status, 200)
+        self.assertEqual(data['url'], 'rtsp://127.0.0.1:8554/livecam1')
+        self.assertEqual(data['coverToken'], 'preview')
+        probe.assert_called_once_with(data['url'])
+        start.assert_called_once_with('start')
+        self.assertEqual(self.controller.store.cameras, [])
+        status, saved = self.request('POST', '/api/cameras/save', {
+            'name': '普通摄像头', 'url': data['url'], 'coverToken': 'preview',
+            'tasks': [], 'regions': []})
+        self.assertEqual(status, 200)
+        self.assertEqual(saved['camera']['cover'], '/covers/preview.jpg')
+        self.assertEqual(saved['camera']['liveDeviceId'], 'USB Camera A')
+        self.assertEqual(saved['camera']['liveDeviceName'], 'USB Camera A')
+        self.assertEqual(saved['camera']['livePath'], 'livecam1')
+
+    def test_normal_edit_preserves_binding_but_changed_url_clears_it(self):
+        original = self.controller.store.save({
+            'id': 'usb1', 'name': 'USB', 'url': 'rtsp://127.0.0.1:8554/livecam1',
+            'tasks': [], 'regions': [], 'cover': '/covers/old.jpg',
+            'liveDeviceId': 'device1', 'liveDeviceName': 'USB', 'livePath': 'livecam1'})
+        payload = {key: original[key] for key in ['id', 'name', 'url', 'tasks', 'regions']}
+        payload['name'] = '修改名称'
+        status, data = self.request('POST', '/api/cameras/save', payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(data['camera']['liveDeviceId'], 'device1')
+        with patch.object(self.controller, 'running', return_value=True):
+            with self.assertRaisesRegex(ValueError, '停止'):
+                self.controller.remove_live_camera('livecam1')
+        payload.update(url='rtsp://127.0.0.1/another', coverToken='changed',
+                       liveDeviceId='伪造设备', livePath='livecam1')
+        self.controller.probes['changed'] = (payload['url'], 0)
+        status, data = self.request('POST', '/api/cameras/save', payload)
+        self.assertEqual(status, 200)
+        self.assertNotIn('liveDeviceId', data['camera'])
+        self.assertNotIn('livePath', data['camera'])
+
+    def test_prepare_failure_does_not_save_camera(self):
+        with patch.object(self.controller, 'control_live_streams'), \
+                patch.object(camera_source, 'wait_live_ready', return_value=False), \
+                patch.object(self.controller, 'probe') as probe:
+            status, data = self.request('POST', '/api/cameras/live/prepare',
+                                        {'deviceId': 'USB Camera A'})
+        self.assertEqual(status, 400)
+        self.assertIn('推流', data['error'])
+        probe.assert_not_called()
+        self.assertEqual(self.controller.store.cameras, [])
+
+    def test_prepare_rejects_simulation_before_changing_mapping(self):
+        with patch.object(self.controller, 'live_stream_status', return_value={
+                'active': True, 'mode': 'lite'}):
+            status, data = self.request('POST', '/api/cameras/live/prepare',
+                                        {'deviceId': 'USB Camera A'})
+        self.assertEqual(status, 400)
+        self.assertIn('模拟流', data['error'])
+        self.assertFalse((self.work/'mediamtx-live.yml').exists())
+
     def test_map_device_and_write_config(self):
         status, data = self.request('POST', '/api/cameras/live', {'device': 'USB Camera A'})
         self.assertEqual(status, 200)

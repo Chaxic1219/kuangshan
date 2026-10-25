@@ -53,9 +53,20 @@ STOP_CONFIRM_SECONDS = 3
 LIFECYCLE_ADMITTED = ('starting', 'active', 'stopping', 'backoff')
 
 
+def read_shared_bytes(path):
+    """避开 Windows 原子替换期间的短暂访问冲突。"""
+    for attempt in range(6):
+        try:
+            return path.read_bytes()
+        except PermissionError:
+            if attempt == 5:
+                raise
+            time.sleep(.01 * 2 ** attempt)
+
+
 def read_json(path, default):
     try:
-        return json.loads(path.read_text(encoding='utf-8'))
+        return json.loads(read_shared_bytes(path).decode('utf-8'))
     except (OSError, ValueError):
         return default
 
@@ -400,8 +411,16 @@ class Controller:
         if self.running(data['id']):
             raise ValueError('请先停止这路分析再修改配置')
         token = data.pop('coverToken', '')
+        binding_keys = ('liveDeviceId', 'liveDeviceName', 'livePath')
+        # 设备关联来自已有记录或本次已验证的取帧结果，不接受表单自行指定。
+        for key in binding_keys:
+            data.pop(key, None)
+        if old and old['url'] == data['url']:
+            data.update({key: old[key] for key in binding_keys if key in old})
         if token in self.probes and self.probes[token][0] == data['url']:
             data['cover'] = '/covers/'+token+'.jpg'
+            if len(self.probes[token]) > 2:
+                data.update(self.probes[token][2])
         elif old and old['url'] == data['url'] and old.get('cover'):
             data['cover'] = old['cover']
         else:
@@ -766,6 +785,23 @@ class Controller:
     def configure_live_cameras(self, selections, start=True):
         return live_cameras.configure(self, selections, start, model_status(), MAX_RUNNING)
 
+    @live_cameras.serialized_operation
+    def prepare_live_camera(self, device_id):
+        """只准备标准 RTSP 源和封面，视频仍由普通保存接口创建。"""
+        stream = self.live_stream_status()
+        if stream.get('active') and stream.get('mode') != 'live':
+            raise ValueError('模拟流正在运行，请先停止模拟流再使用本机摄像头')
+        mapped = self.save_live_camera(device_id)
+        self.control_live_streams('start')
+        if not camera_source.wait_live_ready(mapped['path']):
+            raise ValueError('摄像头推流尚未就绪，请检查设备是否被占用后重试')
+        preview = self.probe(mapped['url'])
+        with self.lock:
+            self.probes[preview['coverToken']] = (mapped['url'], time.monotonic(), {
+                'liveDeviceId': mapped['device'], 'liveDeviceName': mapped['deviceName'],
+                'livePath': mapped['path']})
+        return {'url': mapped['url'], **preview}
+
     def adopt_live_camera(self, device_id, camera, start=False):
         return live_cameras.adopt_single(self, device_id, camera, start,
                                          model_status(), MAX_RUNNING)
@@ -801,7 +837,7 @@ class Controller:
         config = camera_source.ensure_live_config()
         added = camera_source.upsert_live_path(config, path_name, device_name, device_id)
         port = camera_source.config_rtsp_port(config.read_text(encoding='utf-8'))
-        return {'ok': True, 'path': path_name, 'device': device_id,
+        return {'ok': True, 'path': path_name, 'device': device_id, 'deviceName': device_name,
                 'url': camera_source.live_stream_url(path_name, port), 'added': added,
                 'stream': self.live_stream_status(),
                 'message': '已写入配置；启动或重启“本机摄像头流”后即可添加该地址'}
@@ -1055,7 +1091,7 @@ def make_handler(controller, token):
                     file = (base/route[len(prefix):]).resolve()
                     if file.is_relative_to(base) and file.suffix.lower() in ('.jpg', '.jpeg', '.png') and file.is_file():
                         try:
-                            return self.reply(200, file.read_bytes(), 'image/png' if file.suffix.lower() == '.png' else 'image/jpeg')
+                            return self.reply(200, read_shared_bytes(file), 'image/png' if file.suffix.lower() == '.png' else 'image/jpeg')
                         except OSError:
                             break
             self.reply(404, {'error': '资源不存在'})
@@ -1085,6 +1121,8 @@ def make_handler(controller, token):
                 if self.path == '/api/cameras/live/adopt':
                     return self.reply(200, controller.adopt_live_camera(
                         data.get('deviceId'), data.get('camera'), data.get('start', False)))
+                if self.path == '/api/cameras/live/prepare':
+                    return self.reply(200, controller.prepare_live_camera(data.get('deviceId')))
                 if self.path == '/api/cameras/live/remove':
                     return self.reply(200, controller.remove_live_camera(data.get('path')))
                 if self.path == '/api/cameras/live/streams':

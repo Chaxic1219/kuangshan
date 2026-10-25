@@ -1,5 +1,5 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-".venv\Scripts\python.exe" console.py
-pause
+start "" wscript.exe "%~dp0启动分析控制台.vbs"
+exit /b
