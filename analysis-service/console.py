@@ -18,7 +18,9 @@ from urllib.parse import parse_qs, urlsplit, unquote
 import uuid
 from catalog import ROOT, Store, EVENTS, model_status, validate_camera, validate_source, atomic_json, identifier, MEDIA_ROOT, resolve_source
 from alerts import public_status
+from alert_dashboard import DashboardError, dashboard as alert_dashboard, ensure_indexes as ensure_alert_indexes, query_alerts
 from maintenance import BATCH_LIMIT, Maintenance
+from frontend_hosting import serve_frontend
 import camera_source
 import live_cameras
 import process_scope
@@ -72,9 +74,23 @@ def read_json(path, default):
 
 
 def preview_for(camera):
+    """浏览器预览：本地文件用 /preview；本机 MediaMTX RTSP 用 WebRTC 连续播放。"""
     path = resolve_source(camera['url'])
     if isinstance(path, Path) and path.is_file() and path.suffix.lower() in VIDEO_TYPES:
         return {'kind': 'video', 'url': f"/preview/{camera['id']}"}
+    text = str(camera.get('url') or '').strip()
+    match = re.match(
+        r'^rtsps?://(?:127\.0\.0\.1|localhost)(?::\d+)?/([^/?#]+)',
+        text, re.IGNORECASE)
+    if match:
+        stream = match.group(1)
+        base = os.environ.get('KUANGSHAN_WEBRTC_BASE', 'http://127.0.0.1:8889').rstrip('/')
+        return {
+            'kind': 'webrtc',
+            'path': stream,
+            'url': f'{base}/{stream}',
+            'whep': f'{base}/{stream}/whep',
+        }
     return {'kind': 'frames'}
 
 
@@ -88,7 +104,7 @@ class Controller:
         self.scope_factory = scope_factory or process_scope.ProcessScope
         self._generation = 0
         self._mutex = None
-        if scope_factory is None and process_scope.IS_WINDOWS:
+        if scope_factory is None:
             name = 'Local\\kuangshan-analysis-' + hashlib.sha256(
                 str(self.work).lower().encode('utf-8')).hexdigest()[:16]
             self._mutex = process_scope.SingleInstance(name)
@@ -97,6 +113,7 @@ class Controller:
         self.database = self.work/'events.db'
         with closing(sqlite3.connect(self.database)) as db, db:
             db.execute('CREATE TABLE IF NOT EXISTS alerts (id TEXT PRIMARY KEY, camera TEXT, at TEXT, record TEXT)')
+        ensure_alert_indexes(self.database)
         self.watchdog_stop = threading.Event()
         self.watchdog = threading.Thread(target=self._watch, daemon=True)
         self.watchdog.start()
@@ -546,6 +563,23 @@ class Controller:
                 current['desiredRunning'] = False
                 current['lastFailure'] = '回收无法确认'
 
+    def restart(self, cid):
+        """运维强制重启：运行中先 stop 再 start；已停止/失败则等同 start。"""
+        if not self.store.get(cid):
+            raise ValueError('视频不存在')
+        with self.lock:
+            job = self.jobs.get(cid)
+            if job and job['lifecycle'] == 'stopping':
+                raise ValueError('上一实例正在回收，请稍后重试')
+            needs_stop = bool(job and job['lifecycle'] in LIFECYCLE_ADMITTED)
+        if needs_stop:
+            self.stop(cid)
+            with self.lock:
+                job = self.jobs.get(cid)
+                if job and job['lifecycle'] == 'stopping':
+                    raise ValueError('上一实例正在回收，请稍后重试')
+        self.start(cid)
+
     def delete(self, cid):
         if not self.store.get(cid):
             raise ValueError('视频不存在')
@@ -594,6 +628,8 @@ class Controller:
                                                   if job and job['nextRestartMonotonic'] else None),
                                 'restartCount': len(job['restartHistory']) if job else 0,
                                 'latest': latest, 'liveImage': live,
+                                # 带检测框的连续预览（MJPEG）；分析进程每帧更新 live.jpg。
+                                'liveStream': f'/live/{cid}' if running else '',
                                 'modelErrors': status.get('modelErrors', {}), 'results': status.get('results', 0),
                                 'alerts': status.get('alerts', {}),
                                 'resource': status.get('resource', {}),
@@ -821,7 +857,8 @@ class Controller:
         if len(matches) != 1:
             raise ValueError('该摄像头当前不可用，请刷新设备列表')
         device_id = matches[0].get('id', matches[0]['name'])
-        device_name = matches[0]['name']
+        # avfoundation 推流用数字索引更稳；dshow 仍用友好名
+        device_name = matches[0].get('index') or matches[0]['name']
         mapping = camera_source.managed_paths(camera_source.live_config_path())
         if not isinstance(path_name, str):
             raise ValueError('摄像头路径名无效')
@@ -882,13 +919,51 @@ class Controller:
         return {'ok': True, 'action': action, 'output': output,
                 'stream': self.live_stream_status()}
 
-    def alerts_csv(self):
-        """把事件记录导出为 CSV 文本（字段与页面事件表一致）。"""
+    def alerts_csv(self, params=None):
+        """把事件记录导出为 CSV；有筛选参数时与大屏口径一致。"""
         import csv
         import io
         buffer = io.StringIO()
         writer = csv.writer(buffer)
-        writer.writerow(['报警编号', '事件类型', '来源视频', '布控区域', '风险', '置信度', '发生时间', '证据图'])
+        writer.writerow(['报警编号', '事件类型', '来源视频', '布控区域', '风险', '置信度', '发生时间', '证据图', '统计范围起', '统计范围止'])
+        params = params or {}
+        filtered = any(params.get(key) for key in ('preset', 'from', 'to', 'cameraId', 'eventId'))
+        if filtered:
+            common = dict(
+                preset=(params.get('preset') or ['today'])[0],
+                start=(params.get('from') or [None])[0],
+                end=(params.get('to') or [None])[0],
+                camera_id=(params.get('cameraId') or [''])[0].strip() or None,
+                event_id=(params.get('eventId') or [''])[0].strip() or None,
+            )
+            all_rows = []
+            page = 1
+            range_from = range_to = ''
+            while True:
+                chunk = query_alerts(self.database, page=page, page_size=100, **common)
+                range_from = chunk['range']['from']
+                range_to = chunk['range']['to']
+                all_rows.extend(chunk['rows'])
+                if page * 100 >= chunk['total']:
+                    break
+                page += 1
+            for row in all_rows:
+                detections = row.get('detections') or []
+                zones = [d.get('regionName') for d in detections if d.get('regionName')]
+                confidence = max((d.get('confidence') or 0) for d in detections) if detections else 0
+                writer.writerow([
+                    row.get('id', ''),
+                    row.get('eventName') or row.get('eventId', ''),
+                    row.get('cameraName', ''),
+                    '、'.join(dict.fromkeys(zones)) or '全画面',
+                    '中',
+                    f'{confidence * 100:.2f}',
+                    row.get('at', ''),
+                    row.get('image', ''),
+                    range_from,
+                    range_to,
+                ])
+            return buffer.getvalue()
         with closing(sqlite3.connect(self.database)) as db:
             rows = db.execute('SELECT record FROM alerts ORDER BY at DESC').fetchall()
         for (raw,) in rows:
@@ -908,8 +983,54 @@ class Controller:
                 f'{confidence * 100:.2f}',
                 record.get('capturedAt', ''),
                 record.get('image', ''),
+                '',
+                '',
             ])
         return buffer.getvalue()
+
+    def _cameras_for_dashboard(self):
+        cameras = []
+        for camera in self.store.cameras:
+            cid = camera['id']
+            running = self.running(cid)
+            run = self.run_dir(cid)
+            status = read_json(run/cid/'status.json', {}) if run else {}
+            state = status.get('state', 'starting') if running else 'stopped'
+            job = self.jobs.get(cid)
+            if job and job.get('lifecycle') == 'failed':
+                state = 'failed'
+            elif job and job.get('lifecycle') == 'backoff':
+                state = 'backoff'
+            cameras.append({**camera, 'running': running, 'state': state})
+        return cameras
+
+    def alert_dashboard(self, params):
+        return alert_dashboard(
+            self.database,
+            preset=(params.get('preset') or ['today'])[0],
+            start=(params.get('from') or [None])[0],
+            end=(params.get('to') or [None])[0],
+            camera_id=(params.get('cameraId') or [''])[0].strip() or None,
+            event_id=(params.get('eventId') or [''])[0].strip() or None,
+            cameras=self._cameras_for_dashboard(),
+        )
+
+    def alert_query(self, params):
+        try:
+            page = int((params.get('page') or ['1'])[0])
+            page_size = int((params.get('pageSize') or ['50'])[0])
+        except ValueError as exc:
+            raise DashboardError('分页参数无效') from exc
+        return query_alerts(
+            self.database,
+            preset=(params.get('preset') or ['today'])[0],
+            start=(params.get('from') or [None])[0],
+            end=(params.get('to') or [None])[0],
+            camera_id=(params.get('cameraId') or [''])[0].strip() or None,
+            event_id=(params.get('eventId') or [''])[0].strip() or None,
+            page=page,
+            page_size=page_size,
+        )
 
     def preview_path(self, cid):
         camera = self.store.get(cid)
@@ -955,12 +1076,12 @@ def make_handler(controller, token):
         def log_message(self, *args):
             pass
 
-        def reply(self, status, data, kind='application/json; charset=utf-8'):
+        def reply(self, status, data, kind='application/json; charset=utf-8', cache='no-store'):
             raw = data if isinstance(data, bytes) else json.dumps(data, ensure_ascii=False, allow_nan=False).encode()
             self.send_response(status)
             self.send_header('Content-Type', kind)
             self.send_header('Content-Length', str(len(raw)))
-            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Cache-Control', cache)
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('X-Frame-Options', 'DENY')
             self.end_headers()
@@ -1015,6 +1136,43 @@ def make_handler(controller, token):
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
                 pass
 
+        def stream_annotated_live(self, cid):
+            """MJPEG：每帧推送分析进程写出的带框 live.jpg，与推理节奏同步。"""
+            run = controller.run_dir(cid)
+            if not run:
+                return self.reply(404, {'error': '视频未在分析'})
+            live_path = (run / cid / 'live.jpg').resolve()
+            runtime = (controller.work / 'runtime').resolve()
+            if not live_path.is_relative_to(runtime):
+                return self.reply(404, {'error': '资源不存在'})
+            self.send_response(200)
+            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+            self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
+            self.send_header('Pragma', 'no-cache')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.end_headers()
+            last = b''
+            try:
+                while True:
+                    data = None
+                    if live_path.is_file():
+                        try:
+                            data = read_shared_bytes(live_path)
+                        except OSError:
+                            data = None
+                    if data and len(data) > 100 and data != last:
+                        last = data
+                        header = (
+                            b'--frame\r\nContent-Type: image/jpeg\r\n'
+                            b'Content-Length: %d\r\n\r\n' % len(data))
+                        self.wfile.write(header)
+                        self.wfile.write(data)
+                        self.wfile.write(b'\r\n')
+                        self.wfile.flush()
+                    time.sleep(0.04)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                pass
+
         def host_ok(self):
             return self.headers.get('Host') in (f'127.0.0.1:{self.server.server_port}', f'localhost:{self.server.server_port}')
 
@@ -1022,10 +1180,21 @@ def make_handler(controller, token):
             if not self.host_ok():
                 return self.reply(403, {'error': '仅允许本机访问'})
             route = unquote(urlsplit(self.path).path)
+            frontend_root = ROOT.parent
+            frontend_dist = next(
+                (frontend_root/name/'dist'
+                 for name in ('frontend_thin', 'frontend')
+                 if (frontend_root/name/'dist'/'index.html').is_file()),
+                frontend_root/'frontend_thin'/'dist')
+            if serve_frontend(self, route, frontend_dist):
+                return
             static = {'/': ('console.html', 'text/html; charset=utf-8'),
+                      '/legacy/': ('console.html', 'text/html; charset=utf-8'),
                       '/console.css': ('console.css', 'text/css; charset=utf-8'),
                       '/console.js': ('console.js', 'text/javascript; charset=utf-8'),
-                      '/live-cameras.js': ('live-cameras.js', 'text/javascript; charset=utf-8')}
+                      '/live-cameras.js': ('live-cameras.js', 'text/javascript; charset=utf-8'),
+                      '/alert-dashboard.js': ('alert-dashboard.js', 'text/javascript; charset=utf-8'),
+                      '/alert-dashboard.css': ('alert-dashboard.css', 'text/css; charset=utf-8')}
             if route in static:
                 name, kind = static[route]
                 return self.reply(200, (ROOT/name).read_bytes(), kind)
@@ -1039,6 +1208,28 @@ def make_handler(controller, token):
                 try:
                     return self.reply(200, controller.camera_devices())
                 except (ValueError, OSError) as exc:
+                    return self.reply(400, {'error': str(exc)})
+            if route == '/api/alerts/dashboard':
+                params = parse_qs(urlsplit(self.path).query)
+                camera_id = (params.get('cameraId') or [''])[0].strip()
+                if camera_id and not identifier(camera_id):
+                    return self.reply(400, {'error': '视频编号无效'})
+                try:
+                    with controller.lock:
+                        payload = controller.alert_dashboard(params)
+                    return self.reply(200, payload)
+                except DashboardError as exc:
+                    return self.reply(400, {'error': str(exc)})
+            if route == '/api/alerts/query':
+                params = parse_qs(urlsplit(self.path).query)
+                camera_id = (params.get('cameraId') or [''])[0].strip()
+                if camera_id and not identifier(camera_id):
+                    return self.reply(400, {'error': '视频编号无效'})
+                try:
+                    with controller.lock:
+                        payload = controller.alert_query(params)
+                    return self.reply(200, payload)
+                except DashboardError as exc:
                     return self.reply(400, {'error': str(exc)})
             if route == '/api/alerts/outbox':
                 params = parse_qs(urlsplit(self.path).query)
@@ -1063,7 +1254,15 @@ def make_handler(controller, token):
                 return self.reply(200, report)
             if route == '/api/alerts/export.csv':
                 # 事件记录导出：带 BOM，保证 Excel 直接打开中文不乱码。
-                body = '\ufeff' + controller.alerts_csv()
+                params = parse_qs(urlsplit(self.path).query)
+                camera_id = (params.get('cameraId') or [''])[0].strip()
+                if camera_id and not identifier(camera_id):
+                    return self.reply(400, {'error': '视频编号无效'})
+                try:
+                    with controller.lock:
+                        body = '\ufeff' + controller.alerts_csv(params)
+                except DashboardError as exc:
+                    return self.reply(400, {'error': str(exc)})
                 raw = body.encode('utf-8')
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/csv; charset=utf-8')
@@ -1085,13 +1284,22 @@ def make_handler(controller, token):
                 if not path:
                     return self.reply(404, {'error': '该视频不支持连续预览'})
                 return self.reply_video(path)
+            if route.startswith('/live/'):
+                cid = route[len('/live/'):]
+                if not identifier(cid):
+                    return self.reply(404, {'error': '资源不存在'})
+                return self.stream_annotated_live(cid)
             for prefix, folder in [('/covers/', 'covers'), ('/media/', 'runtime'), ('/evidence/', 'evidence')]:
                 if route.startswith(prefix):
                     base = (controller.work/folder).resolve()
                     file = (base/route[len(prefix):]).resolve()
                     if file.is_relative_to(base) and file.suffix.lower() in ('.jpg', '.jpeg', '.png') and file.is_file():
                         try:
-                            return self.reply(200, read_shared_bytes(file), 'image/png' if file.suffix.lower() == '.png' else 'image/jpeg')
+                            kind = 'image/png' if file.suffix.lower() == '.png' else 'image/jpeg'
+                            # 证据图按 UUID 落盘，允许浏览器缓存，避免「查看证据」二次拉取卡住。
+                            cache = ('public, max-age=86400, immutable'
+                                     if prefix == '/evidence/' else 'no-store')
+                            return self.reply(200, read_shared_bytes(file), kind, cache=cache)
                         except OSError:
                             break
             self.reply(404, {'error': '资源不存在'})
@@ -1131,6 +1339,7 @@ def make_handler(controller, token):
                     if self.path == '/api/cameras/save':
                         return self.reply(200, {'camera': controller.save(data)})
                     actions = {'/api/cameras/start': controller.start, '/api/cameras/stop': controller.stop,
+                               '/api/cameras/restart': controller.restart,
                                '/api/cameras/delete': controller.delete}
                     if self.path not in actions or not identifier(data.get('id')):
                         raise ValueError('操作或视频编号无效')

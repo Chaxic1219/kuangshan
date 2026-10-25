@@ -62,7 +62,8 @@ class ScopeFailureTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             try:
-                with patch.object(process_scope.kernel32, 'AssignProcessToJobObject', return_value=0), \
+                from hostplat import process_win
+                with patch.object(process_win.kernel32, 'AssignProcessToJobObject', return_value=0), \
                         patch.object(process_scope.ProcessScope, '_abort_creation', capture):
                     with self.assertRaises(OSError):
                         process_scope.ProcessScope(

@@ -35,8 +35,6 @@ PROJECT = BASE.parents[1]
 ANALYSIS = PROJECT/'analysis-service'
 RUNTIME = BASE/'runtime'
 SESSION = RUNTIME/'session.json'
-MTX = BASE/'bin/mediamtx.exe'
-FFMPEG = BASE/'bin/ffmpeg_bin/ffmpeg.exe'
 CONFIG = {'full': BASE/'mediamtx.yml', 'lite': BASE/'mediamtx-lite.yml',
           'live': BASE/'mediamtx-live.yml'}
 READY_TIMEOUT = 30
@@ -49,7 +47,19 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 if str(ANALYSIS) not in sys.path:
     sys.path.insert(0, str(ANALYSIS))
-import process_scope  # noqa: E402  复用分析服务的 Windows 作业对象封装
+import process_scope  # noqa: E402  跨平台进程生命周期
+from hostplat import binaries as host_binaries  # noqa: E402
+
+
+def _resolved_bins():
+    try:
+        return host_binaries.mediamtx_path(), host_binaries.ffmpeg_path()
+    except FileNotFoundError:
+        # 兼容尚未迁移目录时的历史 Windows 布局
+        return BASE/'bin/mediamtx.exe', BASE/'bin/ffmpeg_bin/ffmpeg.exe'
+
+
+MTX, FFMPEG = _resolved_bins()
 
 
 def now():
@@ -215,25 +225,34 @@ if os.name == 'nt':
 
 
 def mutex_exists():
-    if os.name != 'nt':
-        return False
-    handle = _kernel32.OpenMutexW(SYNCHRONIZE, False, lock_name())
-    if not handle:
-        return False
-    _kernel32.CloseHandle(handle)
-    return True
+    if os.name == 'nt':
+        handle = _kernel32.OpenMutexW(SYNCHRONIZE, False, lock_name())
+        if not handle:
+            return False
+        _kernel32.CloseHandle(handle)
+        return True
+    # posix：SingleInstance 持有锁文件；进程存活时文件存在且可探测
+    safe = ''.join(ch if ch.isalnum() or ch in '-_.' else '_' for ch in lock_name())
+    base = os.environ.get(
+        'KUANGSHAN_LOCK_DIR',
+        os.path.join(os.path.expanduser('~'), '.kuangshan', 'locks'))
+    return os.path.isfile(os.path.join(base, f'{safe}.lock'))
 
 
 def terminate_pid(pid):
-    if os.name != 'nt':
-        return False
-    handle = _kernel32.OpenProcess(PROCESS_TERMINATE, False, int(pid))
-    if not handle:
-        return False
+    if os.name == 'nt':
+        handle = _kernel32.OpenProcess(PROCESS_TERMINATE, False, int(pid))
+        if not handle:
+            return False
+        try:
+            return bool(_kernel32.TerminateProcess(handle, 1))
+        finally:
+            _kernel32.CloseHandle(handle)
     try:
-        return bool(_kernel32.TerminateProcess(handle, 1))
-    finally:
-        _kernel32.CloseHandle(handle)
+        os.kill(int(pid), 15)  # SIGTERM
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
 
 
 def process_identity(pid):
@@ -262,7 +281,8 @@ def identity_problem(session):
         if Path(info['exe']).resolve() != Path(sys.executable).resolve():
             # Windows venv 的 python.exe 是 launcher，实际进程映像是基础解释器；
             # 这种情况下只要求可执行文件是 Python 解释器。
-            if Path(info['exe']).name.lower() not in ('python.exe', 'pythonw.exe'):
+            exe_name = Path(info['exe']).name.lower()
+            if exe_name not in ('python.exe', 'pythonw.exe', 'python', 'python3'):
                 return '可执行路径与记录不符'
     except OSError:
         return '可执行路径无法确认'

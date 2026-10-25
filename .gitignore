@@ -5,8 +5,15 @@ analysis-service/.venv/
 **/__pycache__/
 *.pyc
 
-# 第三方推流工具二进制与证书私钥不入库（视频素材与配置入库）
-kstool/mediamtx/bin/
+# 第三方推流工具：Windows 二进制不入库；macOS darwin* 入库以便开箱运行
+kstool/mediamtx/bin/*
+!kstool/mediamtx/bin/README.md
+!kstool/mediamtx/bin/darwin/
+!kstool/mediamtx/bin/darwin/**
+!kstool/mediamtx/bin/darwin-arm64/
+!kstool/mediamtx/bin/darwin-arm64/**
+!kstool/mediamtx/bin/darwin-x64/
+!kstool/mediamtx/bin/darwin-x64/**
 kstool/mediamtx/runtime/
 kstool/mediamtx/auto.key
 

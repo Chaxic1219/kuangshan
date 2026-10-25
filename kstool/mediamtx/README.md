@@ -4,11 +4,11 @@
 > 联合验收见 [../../docs/acceptance.md](../../docs/acceptance.md)。
 
 ## 目录结构
-- `bin/mediamtx.exe` — 流媒体服务器（v1.21.0）
-- `bin/ffmpeg_bin/` — FFmpeg（负责把本地视频循环推成 RTSP 流，或采集本机摄像头）
+- `bin/mediamtx.exe`、`bin/ffmpeg_bin/` — Windows 流媒体与 FFmpeg（本机自备，不入库）
+- `bin/darwin/`、`bin/darwin-arm64/`、`bin/darwin-x64/` — macOS 二进制（入库；也可用 `scripts/bootstrap_darwin.*` 重下）
 - `mediamtx.yml` — 完整配置（18 路）；`mediamtx-lite.yml` — 精简配置（8 路）
 - `mediamtx-live.yml` — 本机摄像头模式配置（由控制台“本机摄像头接入”面板生成受管段）
-- `stream_control.py` — 安全启停入口：MediaMTX 与 FFmpeg 归入项目专属作业对象
+- `stream_control.py` — 安全启停：Windows 作业对象 / macOS·Linux 进程组
 
 ## 本机摄像头接入（live 模式）
 控制台“视频”页顶部面板可枚举本机摄像头并写入 `mediamtx-live.yml`（受管段，可重复增删，

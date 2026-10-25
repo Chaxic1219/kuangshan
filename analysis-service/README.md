@@ -8,14 +8,54 @@
 
 ## 快速开始
 
+### Windows
+
 1. 双击 `启动分析控制台.vbs`（无终端窗口；原 `.bat` 入口也会转为后台启动）
-2. 打开 http://127.0.0.1:8765/
+2. 打开 http://127.0.0.1:8765/ （有 `frontend/dist` 时进入 Vue 控制台 `/ui/`；否则仍为旧版页面）
 3. 添加视频 →「测试连接并截取封面」→ 选择场景 →（区域入侵需绘制区域）→ 保存 → 启动分析
+
+### macOS
+
+1. `cd analysis-service && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
+2. 确认 `kstool/mediamtx/bin/darwin/` 已有 `mediamtx`、`ffmpeg`（仓库已带；或运行 `bash kstool/mediamtx/scripts/bootstrap_darwin.sh`）
+3. 双击仓库根目录 `启动分析控制台.command`，或：` .venv/bin/python launch_console_posix.py`
+4. 打开 http://127.0.0.1:8765/ui/ （登录 `admin` / `admin`）
+5. 首次用本机摄像头时，在「系统设置 → 隐私与安全性 → 摄像头」允许终端 / Python
 
 也可选择本机演示视频（`kstool/mediamtx/videos/*.mp4`）。
 
+| 入口 | 地址 | 说明 |
+|---|---|---|
+| 新版控制台 | http://127.0.0.1:8765/ui/ | Pure Admin 精简版完整骨架；登录 `admin` / `admin` |
+| 旧版控制台 | http://127.0.0.1:8765/legacy/ | 原生 HTML 回退入口，配置与分析逻辑相同 |
+
+前端工程目录为 `frontend_thin/`（官方 thin 骨架 + 矿山业务菜单）。构建产物由控制台优先托管 `frontend_thin/dist`。
+
+```powershell
+cd frontend_thin
+pnpm install
+pnpm test
+pnpm typecheck
+pnpm build
+```
+
+登录后侧栏仅五个业务标签页：视频管理、实时监控、告警大屏、场景模型、事件记录。模板登录只是本机演示壳，分析写接口仍使用控制台令牌。
+
+### 实时监控流畅预览
+
+监控页默认「流畅预览」（连续播放），不是 1.5 秒一张分析截图：
+
+| 视频来源 | 预览方式 | 前置条件 |
+|---|---|---|
+| 本地 mp4 | `/preview/` 连续播放 | 无 |
+| 本机 RTSP（`rtsp://127.0.0.1:8554/...`） | MediaMTX WebRTC（8889） | 先启动 `kstool\启动-本机摄像头.bat` 或模拟流 bat |
+| 其他远程 RTSP | 仍为分析截帧 | 浏览器无法直接播 RTSP |
+
+需要看检测框时，在监控卡片上切换到「检测截帧」。WebRTC 跨域已允许控制台 Origin；改 `mediamtx*.yml` 后需重启推流。
+
 控制台后台日志保存在 `data/console.log`；启动失败会弹出提示。重复启动会复用已运行的控制台。
 普通编辑保存保留同一视频地址的 USB 设备关联；改为其他地址会清除旧关联，新接入以已验证的取帧结果建立关联。
+更新 `console.py` 或前端托管逻辑后需重启控制台进程才会生效。
 
 ## 模型与场景
 
@@ -56,9 +96,9 @@
 返回普通导入所需的 `url`、`coverToken`、`cover`；最终统一通过 `/api/cameras/save` 保存。
 原有 `live/adopt`、`live/batch` 接口保留兼容，控制台不再调用。写入接口沿用控制台令牌校验。
 
-采集由 FFmpeg 从 dshow 读取并转码（H.264、`ultrafast`、无 B 帧、`yuv420p`、低码率），
-推流进程由 MediaMTX 的 `runOnInit` 托管，启停与端口冲突检查复用 `stream_control.py` 的
-作业对象机制。默认不指定输入分辨率和帧率，由驱动选择格式。管理 API 开启时，每路最多等待 12 秒出流，再用真实截帧验证；API 关闭时由截帧直接验证。多路失败时需等待各路超时结束。
+采集由 FFmpeg 按平台读取并转码（Windows `dshow` / macOS `avfoundation`；H.264、`ultrafast`、无 B 帧、`yuv420p`、低码率），
+推流进程由 MediaMTX 的 `runOnInit` 托管，启停与端口冲突检查复用 `stream_control.py`
+（Windows 作业对象 / POSIX 进程组）。默认不指定输入分辨率和帧率。管理 API 开启时，每路最多等待 12 秒出流，再用真实截帧验证；API 关闭时由截帧直接验证。
 
 限制：摄像头同一时刻只能被一个程序占用；多路 USB 摄像头建议分散到不同 USB 控制器；
 转码占用 CPU，6 路并发上限照常适用；虚拟摄像头接入的是虚拟内容，注意别选错设备。
