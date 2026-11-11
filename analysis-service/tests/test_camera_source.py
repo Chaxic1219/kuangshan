@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 import camera_source
+from hostplat import camera as host_camera
 
 from camera_source import (build_push_command, ensure_live_config, list_camera_devices,
                            managed_paths, remove_live_path, upsert_live_path,
@@ -22,6 +23,11 @@ class FakeFFprobeExit:
 
 
 class CommandTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.object(host_camera, 'capture_backend', return_value='dshow')
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_push_command_uses_dshow_and_rtsp(self):
         command = build_push_command(
             'USB2.0 PC CAMERA', 'livecam_usb1', framerate=25, size='1280x720')
@@ -48,6 +54,11 @@ class CommandTests(unittest.TestCase):
 
 
 class DeviceListTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.object(host_camera, 'capture_backend', return_value='dshow')
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def run_parse(self, text):
         with patch('camera_source.run_ffmpeg', return_value=FakeFFprobeExit(text)):
             return list_camera_devices()
@@ -92,7 +103,21 @@ class DeviceListTests(unittest.TestCase):
         self.assertTrue(all(not d['usable'] for d in devices))
 
 
+class DeviceAliasTests(unittest.TestCase):
+    def test_avfoundation_aliases_cover_legacy_ids(self):
+        aliases = camera_source.device_aliases('avfoundation:0', '0')
+        self.assertIn('avfoundation:0', aliases)
+        self.assertIn('avf:0', aliases)
+        self.assertIn('0', aliases)
+        self.assertIn('0:none', aliases)
+
+
 class ConfigUpsertTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.object(host_camera, 'capture_backend', return_value='dshow')
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_batch_collision_does_not_write_first_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp)/'m.yml'

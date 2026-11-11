@@ -8,5 +8,6 @@ local_keys.json
 local_keys.tmp
 data/*
 !data/cameras.json
-weights/*.pt
+# 权重由 Git LFS 跟踪（见仓库根 .gitattributes）；仅忽略下载临时文件
 weights/*.download
+weights/*.tmp

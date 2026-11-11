@@ -40,8 +40,9 @@ def _candidates(name: str) -> list[Path]:
             paths.append(KSTOOL_BIN / 'ffmpeg_bin' / 'ffmpeg.exe')
     # darwin 也可放通用目录 bin/darwin/
     if key.startswith('darwin'):
-        paths.insert(0, KSTOOL_BIN / 'darwin' / name)
-        paths.insert(1, KSTOOL_BIN / 'darwin' / exe)
+        # 架构目录优先；通用 darwin 目录只作为后备（可能存放旧版本）
+        paths.append(KSTOOL_BIN / 'darwin' / name)
+        paths.append(KSTOOL_BIN / 'darwin' / exe)
     if key.startswith('linux'):
         paths.insert(0, KSTOOL_BIN / 'linux' / name)
     return paths

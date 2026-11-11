@@ -54,7 +54,7 @@ def launch(foreground: bool = False) -> None:
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description='启动矿山分析控制台（POSIX）')
+    parser = argparse.ArgumentParser(description='启动视联洞察分析控制台（POSIX）')
     parser.add_argument('--foreground', action='store_true', help='前台运行（不落后台）')
     args = parser.parse_args(argv)
     try:

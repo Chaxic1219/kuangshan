@@ -11,11 +11,13 @@ apiAddress: 127.0.0.1:9997
 
 # RTSP 服务（模拟摄像头输出）
 rtsp: yes
-rtspAddress: :8554
+rtspAddress: :8560
 
 # 浏览器预览：WebRTC（前端低延迟播放）+ HLS（备用）
 webrtc: yes
 webrtcAddress: :8889
+# 控制台页面在 8765，WHEP 请求来自该 Origin
+webrtcAllowOrigins: ["http://127.0.0.1:8765", "http://localhost:8765", "http://127.0.0.1:8848", "http://localhost:8848"]
 # live 模式关闭 HLS（本机摄像头面板不需要；8888 常被其他程序占用）
 hls: no
 hlsAddress: :8888
@@ -26,6 +28,15 @@ rtmp: no
 srt: no
 
 paths:
-
 # ---- live cameras (managed by camera_source.py) ----
+  livecam1:
+    # live-device-id: avfoundation:0
+    runOnInit: >-
+      "bin/darwin-arm64/ffmpeg" -f avfoundation -framerate 30 -video_size 1280x720 -i "0:none" -c:v libx264 -preset ultrafast -tune zerolatency -b:v 1200k -pix_fmt yuv420p -bf 0 -an -f rtsp rtsp://127.0.0.1:8560/livecam1
+    runOnInitRestart: yes
+  livecam2:
+    # live-device-id: avfoundation:1
+    runOnInit: >-
+      "bin/darwin-arm64/ffmpeg" -f avfoundation -framerate 30 -video_size 1280x720 -i "1:none" -c:v libx264 -preset ultrafast -tune zerolatency -b:v 1200k -pix_fmt yuv420p -bf 0 -an -f rtsp rtsp://127.0.0.1:8560/livecam2
+    runOnInitRestart: yes
 # ---- live cameras end ----

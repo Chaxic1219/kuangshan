@@ -1,0 +1,2 @@
+analysis-service/weights/*.pt filter=lfs diff=lfs merge=lfs -text
+kstool/mediamtx/bin/**/mediamtx filter=lfs diff=lfs merge=lfs -text

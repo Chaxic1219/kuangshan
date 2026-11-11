@@ -8,6 +8,7 @@ from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from console import Controller, make_handler
+from auth_http import admin_bearer
 
 
 class ConsoleFlowTests(unittest.TestCase):
@@ -15,6 +16,7 @@ class ConsoleFlowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             work = Path(folder)
             controller = Controller(work)
+            bearer = admin_bearer(controller)
             server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(controller, 'flow-token'))
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -26,7 +28,7 @@ class ConsoleFlowTests(unittest.TestCase):
                 self.assertNotIn('\\', url)
 
                 probe_body = json.dumps({'url': url}).encode()
-                probe = self._post(host, port, '/api/cameras/probe', probe_body, 'flow-token')
+                probe = self._post(host, port, '/api/cameras/probe', probe_body, bearer)
                 self.assertIn('coverToken', probe)
                 self.assertTrue((work / 'covers' / (probe['coverToken'] + '.jpg')).is_file())
 
@@ -42,10 +44,10 @@ class ConsoleFlowTests(unittest.TestCase):
                     'regions': [],
                 }
                 saved = self._post(host, port, '/api/cameras/save',
-                                   json.dumps(payload).encode(), 'flow-token')
+                                   json.dumps(payload).encode(), bearer)
                 cid = saved['camera']['id']
                 self._post(host, port, '/api/cameras/start',
-                           json.dumps({'id': cid}).encode(), 'flow-token')
+                           json.dumps({'id': cid}).encode(), bearer)
 
                 deadline = time.monotonic() + 45
                 results = 0
@@ -59,7 +61,7 @@ class ConsoleFlowTests(unittest.TestCase):
                 self.assertGreater(results, 0, '启动后应产生分析结果')
 
                 self._post(host, port, '/api/cameras/stop',
-                           json.dumps({'id': cid}).encode(), 'flow-token')
+                           json.dumps({'id': cid}).encode(), bearer)
                 state = json.loads(self._get(host, port, '/api/state'))
                 cam = next(c for c in state['cameras'] if c['id'] == cid)
                 self.assertFalse(cam['running'])
@@ -78,12 +80,13 @@ class ConsoleFlowTests(unittest.TestCase):
         conn.close()
         return body
 
-    def _post(self, host, port, path, body, token):
+    def _post(self, host, port, path, body, bearer):
         conn = HTTPConnection(host, port, timeout=30)
         conn.request(
             'POST', path, body=body,
             headers={'Host': f'{host}:{port}', 'Content-Type': 'application/json',
-                     'Content-Length': str(len(body)), 'X-Console-Token': token})
+                     'Content-Length': str(len(body)),
+                     'Authorization': f'Bearer {bearer}'})
         response = conn.getresponse()
         text = response.read().decode()
         self.assertEqual(response.status, 200, text)

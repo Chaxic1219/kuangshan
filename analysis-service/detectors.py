@@ -1,4 +1,4 @@
-"""三组本地 YOLO 权重及 OpenCV 场景适配。"""
+"""本地 YOLO 权重及 OpenCV 场景适配。"""
 import os
 os.environ.setdefault('YOLO_AUTOINSTALL', 'false')
 os.environ.setdefault('YOLO_VERBOSE', 'false')

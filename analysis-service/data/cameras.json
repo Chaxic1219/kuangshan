@@ -42,5 +42,89 @@
     ],
     "regions": [],
     "cover": "/covers/be68da6f63fa4fbfb17673c243254dc9.jpg"
+  },
+  {
+    "id": "b103104690f3",
+    "name": "安全帽测试",
+    "location": "",
+    "url": "rtsp://127.0.0.1:8560/livecam1",
+    "tasks": [
+      {
+        "eventId": "no_helmet",
+        "confidence": 0.4,
+        "interval": 0,
+        "cooldown": 30,
+        "enabled": true,
+        "regionIds": [],
+        "dark": 0.12,
+        "bright": 0.88,
+        "model": "ppe",
+        "id": "no_helmet"
+      }
+    ],
+    "regions": [],
+    "cover": "/covers/f9f7e78286fe4467adb5866dbaaa9e8f.jpg",
+    "liveDeviceId": "avfoundation:0",
+    "liveDeviceName": "MacBook Air相机",
+    "livePath": "livecam1"
+  },
+  {
+    "id": "8ab85cad51b9",
+    "name": "123",
+    "location": "12312313",
+    "url": "rtsp://127.0.0.1:8560/livecam1",
+    "tasks": [
+      {
+        "eventId": "intrusion",
+        "model": "person_yolov8n",
+        "confidence": 0.4,
+        "interval": 0,
+        "cooldown": 30,
+        "enabled": true,
+        "regionIds": [
+          "zone_156f398aa0df4383"
+        ],
+        "dark": 0.12,
+        "bright": 0.88,
+        "id": "intrusion"
+      }
+    ],
+    "regions": [
+      {
+        "id": "zone_156f398aa0df4383",
+        "name": "布控区域 1",
+        "enabled": true,
+        "points": [
+          [
+            0.04262262658227848,
+            0.035388830285982185
+          ],
+          [
+            0.9389586629746836,
+            0.08095991561181434
+          ],
+          [
+            0.9399146228902954,
+            0.6512467768401313
+          ],
+          [
+            0.6959099749472574,
+            0.8616458626347867
+          ],
+          [
+            0.3901181764240506,
+            0.8448707805907173
+          ],
+          [
+            0.12045094936708861,
+            0.7873740037505861
+          ]
+        ]
+      }
+    ],
+    "liveDeviceId": "avfoundation:0",
+    "liveDeviceName": "0",
+    "livePath": "livecam1",
+    "cover": "/covers/9a590f95dc9d4c98a359f6a33f03423d.jpg"
   }
 ]

@@ -8,3 +8,4 @@ torchvision==0.21.0
 lap>=0.5.12
 dill>=0.3.8
 psutil>=5.9.0
+Pillow>=10.0.0

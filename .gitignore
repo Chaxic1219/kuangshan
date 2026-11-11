@@ -5,6 +5,14 @@ analysis-service/.venv/
 **/__pycache__/
 *.pyc
 
+# 本机杂项与归档（重复前端树、备份）
+.DS_Store
+**/.DS_Store
+.pnpm-store/
+outputs/
+_archive/
+_mine_backup/
+
 # 第三方推流工具：Windows 二进制不入库；macOS darwin* 入库以便开箱运行
 kstool/mediamtx/bin/*
 !kstool/mediamtx/bin/README.md
@@ -19,3 +27,11 @@ kstool/mediamtx/auto.key
 
 # 数据库备份不入库
 backups/
+
+# 前端依赖与构建缓存（唯一源：frontend_thin；dist 入库便于开箱访问 /ui/）
+frontend_thin/node_modules/
+frontend_thin/.vite/
+frontend_thin/.vite-temp/
+
+# 头脑风暴可视化会话产物
+.superpowers/

@@ -2,10 +2,34 @@
   "general": {
     "file": "general.pt",
     "source": "https://github.com/ultralytics/ultralytics",
-    "url": null,
+    "url": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8n.pt",
     "license": "AGPL-3.0",
     "sha256": "f59b3d833e2ff32e194b5bb8e08d211dc7c5bdf144b90d2c8412c47ccfc83b36",
     "bytes": 6549796
+  },
+  "person_yolov8n": {
+    "file": "yolov8n.pt",
+    "source": "https://github.com/ultralytics/assets",
+    "url": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8n.pt",
+    "license": "AGPL-3.0",
+    "sha256": "f59b3d833e2ff32e194b5bb8e08d211dc7c5bdf144b90d2c8412c47ccfc83b36",
+    "bytes": 6549796
+  },
+  "person_yolov8s": {
+    "file": "yolov8s.pt",
+    "source": "https://github.com/ultralytics/assets",
+    "url": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8s.pt",
+    "license": "AGPL-3.0",
+    "sha256": "1f47a78bf100391c2a140b7ac73a1caae18c32779be7d310658112f7ac9aa78a",
+    "bytes": 22588772
+  },
+  "factory_person": {
+    "file": "factory_person.pt",
+    "source": "person_results/new/new/best.pt",
+    "url": null,
+    "license": "private",
+    "sha256": "479f475d9c22e7b39aff71dd034ff2698da3835f05aa35e6741a0b9acc5e16e5",
+    "bytes": 118306099
   },
   "ppe": {
     "file": "ppe.pt",

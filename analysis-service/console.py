@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -18,7 +19,14 @@ from urllib.parse import parse_qs, urlsplit, unquote
 import uuid
 from catalog import ROOT, Store, EVENTS, model_status, validate_camera, validate_source, atomic_json, identifier, MEDIA_ROOT, resolve_source
 from alerts import public_status
-from alert_dashboard import DashboardError, dashboard as alert_dashboard, ensure_indexes as ensure_alert_indexes, query_alerts
+from alert_dashboard import (
+    DashboardError, dashboard as alert_dashboard, ensure_indexes as ensure_alert_indexes,
+    pending_summary as alert_pending_summary, query_alerts)
+from alert_bulk import bulk_dispose_pending
+from alert_disposition import apply_disposition, public_fields
+from contacts import load_contacts, save_contacts
+from evidence_backfill import backfill_missing_videos
+import auth_users
 from maintenance import BATCH_LIMIT, Maintenance
 from frontend_hosting import serve_frontend
 import camera_source
@@ -123,6 +131,9 @@ class Controller:
         self.maintenance_stop = threading.Event()
         self.maintenance_thread = threading.Thread(target=self._maintain_loop, daemon=True)
         self.maintenance_thread.start()
+        auth_users.bind_session_file(self.work / 'users.json')
+        # 启动即迁移：出厂默认口令的 admin 会被打上 mustChangePassword。
+        auth_users.ensure_users(self.users_path())
 
     # ==================== 存储维护与空间守卫 ====================
 
@@ -864,8 +875,8 @@ class Controller:
             raise ValueError('摄像头路径名无效')
         path_name = (path_name or '').strip()
         if not path_name:
-            path_name = next((p for p, d in mapping.items()
-                              if d in {device_id, device_name}), '')
+            aliases = camera_source.device_aliases(device_id, device_name)
+            path_name = next((p for p, d in mapping.items() if d in aliases), '')
         if not path_name:
             index = 1
             while 'livecam%d' % index in camera_source.all_path_names(camera_source.live_config_path()):
@@ -925,9 +936,18 @@ class Controller:
         import io
         buffer = io.StringIO()
         writer = csv.writer(buffer)
-        writer.writerow(['报警编号', '事件类型', '来源视频', '布控区域', '风险', '置信度', '发生时间', '证据图', '统计范围起', '统计范围止'])
+        writer.writerow([
+            '报警编号', '事件类型', '来源视频', '安装位置', '布控区域', '风险', '置信度',
+            '发生时间', '处置状态', '处置人', '处置时间', '证据图', '统计范围起', '统计范围止',
+        ])
+        risk_zh = {'high': '高', 'medium': '中', 'low': '低'}
+        disp_zh = {
+            'pending': '未处置', 'handled': '已处置', 'false_positive': '误报',
+        }
         params = params or {}
-        filtered = any(params.get(key) for key in ('preset', 'from', 'to', 'cameraId', 'eventId'))
+        filtered = any(params.get(key) for key in (
+            'preset', 'from', 'to', 'cameraId', 'eventId', 'disposition',
+            'riskLevel', 'location'))
         if filtered:
             common = dict(
                 preset=(params.get('preset') or ['today'])[0],
@@ -935,6 +955,10 @@ class Controller:
                 end=(params.get('to') or [None])[0],
                 camera_id=(params.get('cameraId') or [''])[0].strip() or None,
                 event_id=(params.get('eventId') or [''])[0].strip() or None,
+                disposition=(params.get('disposition') or [''])[0].strip() or None,
+                risk_level=(params.get('riskLevel') or [''])[0].strip() or None,
+                location=(params.get('location') or [''])[0].strip() or None,
+                cameras=self._cameras_for_dashboard(),
             )
             all_rows = []
             page = 1
@@ -955,15 +979,24 @@ class Controller:
                     row.get('id', ''),
                     row.get('eventName') or row.get('eventId', ''),
                     row.get('cameraName', ''),
+                    row.get('location') or '',
                     '、'.join(dict.fromkeys(zones)) or '全画面',
-                    '中',
+                    risk_zh.get(row.get('riskLevel'), row.get('riskLevel') or ''),
                     f'{confidence * 100:.2f}',
                     row.get('at', ''),
+                    disp_zh.get(row.get('disposition'), row.get('disposition') or '未处置'),
+                    row.get('handledBy') or '',
+                    row.get('handledAt') or '',
                     row.get('image', ''),
                     range_from,
                     range_to,
                 ])
             return buffer.getvalue()
+        location_map = {
+            str(cam.get('id')): str(cam.get('location') or '').strip()
+            for cam in self._cameras_for_dashboard()
+            if cam.get('id')
+        }
         with closing(sqlite3.connect(self.database)) as db:
             rows = db.execute('SELECT record FROM alerts ORDER BY at DESC').fetchall()
         for (raw,) in rows:
@@ -974,14 +1007,19 @@ class Controller:
             detections = record.get('detections') or []
             zones = [d.get('regionName') for d in detections if d.get('regionName')]
             confidence = max((d.get('confidence') or 0) for d in detections) if detections else 0
+            fields = public_fields(record)
             writer.writerow([
                 record.get('alertCode') or record.get('id', ''),
                 record.get('eventName') or record.get('eventId', ''),
                 record.get('cameraName', ''),
+                location_map.get(str(record.get('cameraId') or ''), ''),
                 '、'.join(dict.fromkeys(zones)) or '全画面',
-                '低' if record.get('engine') in ('local', 'opencv') else '中',
+                risk_zh.get(fields['riskLevel'], fields['riskLevel']),
                 f'{confidence * 100:.2f}',
                 record.get('capturedAt', ''),
+                disp_zh.get(fields['disposition'], fields['disposition']),
+                fields.get('handledBy') or '',
+                fields.get('handledAt') or '',
                 record.get('image', ''),
                 '',
                 '',
@@ -1028,9 +1066,120 @@ class Controller:
             end=(params.get('to') or [None])[0],
             camera_id=(params.get('cameraId') or [''])[0].strip() or None,
             event_id=(params.get('eventId') or [''])[0].strip() or None,
+            disposition=(params.get('disposition') or [''])[0].strip() or None,
+            risk_level=(params.get('riskLevel') or [''])[0].strip() or None,
+            location=(params.get('location') or [''])[0].strip() or None,
+            cameras=self._cameras_for_dashboard(),
             page=page,
             page_size=page_size,
+            sort=(params.get('sort') or ['time'])[0].strip() or 'time',
         )
+
+    def alert_pending_summary(self):
+        return alert_pending_summary(self.database)
+
+    def contacts_path(self):
+        return self.work / 'contacts.json'
+
+    def users_path(self):
+        return self.work / 'users.json'
+
+    def get_contacts(self):
+        return load_contacts(self.contacts_path())
+
+    def put_contacts(self, payload):
+        return save_contacts(self.contacts_path(), payload)
+
+    def auth_login(self, payload):
+        auth_users.ensure_users(self.users_path())
+        return auth_users.login(
+            self.users_path(),
+            payload.get('username') or '',
+            payload.get('password') or '')
+
+    def auth_refresh(self, payload):
+        return auth_users.refresh_session(payload.get('refreshToken') or '')
+
+    def auth_change_password(self, username, payload):
+        return auth_users.change_password(
+            self.users_path(),
+            username,
+            payload.get('oldPassword') or '',
+            payload.get('newPassword') or '')
+
+    def auth_update_profile(self, username, payload):
+        return auth_users.update_profile(
+            self.users_path(),
+            username,
+            nickname=payload.get('nickname'),
+            avatar=payload.get('avatar'))
+
+    def auth_list_users(self):
+        return auth_users.list_users(self.users_path())
+
+    def auth_create_user(self, payload):
+        return auth_users.create_user(
+            self.users_path(),
+            payload.get('username') or '',
+            payload.get('password') or '',
+            nickname=payload.get('nickname') or '',
+            roles=payload.get('roles'))
+
+    def auth_update_user(self, username, payload):
+        return auth_users.update_user(
+            self.users_path(),
+            username,
+            nickname=payload.get('nickname'),
+            roles=payload.get('roles'))
+
+    def auth_reset_password(self, username, payload):
+        return auth_users.reset_password(
+            self.users_path(),
+            username,
+            payload.get('newPassword') or payload.get('password') or '')
+
+    def auth_delete_user(self, username, *, actor=''):
+        return auth_users.delete_user(
+            self.users_path(), username, actor=actor)
+
+    def dispose_alert(self, alert_id, disposition, handled_by='', note=''):
+        if not isinstance(alert_id, str) or not alert_id.strip():
+            raise ValueError('告警编号无效')
+        alert_id = alert_id.strip()
+        with self.lock, closing(sqlite3.connect(self.database, timeout=30)) as db, db:
+            row = db.execute('SELECT record FROM alerts WHERE id=?', (alert_id,)).fetchone()
+            if not row:
+                raise ValueError('告警不存在')
+            try:
+                record = json.loads(row[0])
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError('告警记录损坏') from exc
+            updated = apply_disposition(record, disposition, handled_by=handled_by, note=note)
+            db.execute('UPDATE alerts SET record=? WHERE id=?',
+                       (json.dumps(updated, ensure_ascii=False), alert_id))
+        return {
+            'ok': True,
+            'id': alert_id,
+            'disposition': updated['disposition'],
+            'handledAt': updated.get('handledAt', ''),
+            'handledBy': updated.get('handledBy', ''),
+        }
+
+    def bulk_dispose_alerts(self, *, keep_within_hours=24, disposition='handled',
+                            handled_by='系统清理', note='历史未处置积压清理'):
+        with self.lock:
+            return bulk_dispose_pending(
+                self.database,
+                keep_within_hours=keep_within_hours,
+                disposition=disposition,
+                handled_by=handled_by,
+                note=note,
+            )
+
+    def backfill_alert_videos(self, *, limit=0):
+        with self.lock:
+            return backfill_missing_videos(
+                self.database, self.work / 'evidence', limit=int(limit or 0))
 
     def preview_path(self, cid):
         camera = self.store.get(cid)
@@ -1181,11 +1330,8 @@ def make_handler(controller, token):
                 return self.reply(403, {'error': '仅允许本机访问'})
             route = unquote(urlsplit(self.path).path)
             frontend_root = ROOT.parent
-            frontend_dist = next(
-                (frontend_root/name/'dist'
-                 for name in ('frontend_thin', 'frontend')
-                 if (frontend_root/name/'dist'/'index.html').is_file()),
-                frontend_root/'frontend_thin'/'dist')
+            # 唯一正式前端：frontend_thin（旧树已归档至 _archive/）
+            frontend_dist = frontend_root / 'frontend_thin' / 'dist'
             if serve_frontend(self, route, frontend_dist):
                 return
             static = {'/': ('console.html', 'text/html; charset=utf-8'),
@@ -1201,7 +1347,8 @@ def make_handler(controller, token):
             if route == '/api/state':
                 with controller.lock:
                     data = controller.state()
-                return self.reply(200, {**data, 'token': token})
+                # 写操作改走 Bearer；不再通过 state 下发可写 console token。
+                return self.reply(200, {**data, 'token': ''})
             if route == '/api/samples':
                 return self.reply(200, controller.samples())
             if route == '/api/cameras/devices':
@@ -1231,6 +1378,21 @@ def make_handler(controller, token):
                     return self.reply(200, payload)
                 except DashboardError as exc:
                     return self.reply(400, {'error': str(exc)})
+            if route == '/api/alerts/pending-summary':
+                with controller.lock:
+                    payload = controller.alert_pending_summary()
+                return self.reply(200, payload)
+            if route == '/api/contacts':
+                with controller.lock:
+                    payload = controller.get_contacts()
+                return self.reply(200, payload)
+            if route == '/api/auth/users':
+                try:
+                    auth_users.require_admin(controller.users_path(), self._bearer())
+                    with controller.lock:
+                        return self.reply(200, controller.auth_list_users())
+                except PermissionError as exc:
+                    return self.reply(403, {'success': False, 'message': str(exc)})
             if route == '/api/alerts/outbox':
                 params = parse_qs(urlsplit(self.path).query)
                 camera_id = (params.get('cameraId') or [''])[0].strip()
@@ -1293,9 +1455,14 @@ def make_handler(controller, token):
                 if route.startswith(prefix):
                     base = (controller.work/folder).resolve()
                     file = (base/route[len(prefix):]).resolve()
-                    if file.is_relative_to(base) and file.suffix.lower() in ('.jpg', '.jpeg', '.png') and file.is_file():
+                    if not (file.is_relative_to(base) and file.is_file()):
+                        break
+                    suffix = file.suffix.lower()
+                    if prefix == '/evidence/' and suffix == '.mp4':
+                        return self.reply_video(file)
+                    if suffix in ('.jpg', '.jpeg', '.png'):
                         try:
-                            kind = 'image/png' if file.suffix.lower() == '.png' else 'image/jpeg'
+                            kind = 'image/png' if suffix == '.png' else 'image/jpeg'
                             # 证据图按 UUID 落盘，允许浏览器缓存，避免「查看证据」二次拉取卡住。
                             cache = ('public, max-age=86400, immutable'
                                      if prefix == '/evidence/' else 'no-store')
@@ -1304,20 +1471,140 @@ def make_handler(controller, token):
                             break
             self.reply(404, {'error': '资源不存在'})
 
+        def _bearer(self):
+            header = self.headers.get('Authorization') or ''
+            if header.lower().startswith('bearer '):
+                return header[7:].strip()
+            return (self.headers.get('X-Auth-Token') or '').strip()
+
         def do_POST(self):
-            if not self.host_ok() or self.headers.get('Origin') not in (None, 'http://'+self.headers.get('Host', '')) or not secrets.compare_digest(self.headers.get('X-Console-Token', ''), token):
+            if not self.host_ok() or self.headers.get('Origin') not in (None, 'http://'+self.headers.get('Host', '')):
                 return self.reply(403, {'error': '请求校验失败，请刷新页面'})
+            path = unquote(urlsplit(self.path).path)
+            auth_open = path in (
+                '/api/auth/login', '/login', '/api/auth/refresh', '/refresh-token')
+            auth_session = (
+                path == '/api/auth/change-password'
+                or path == '/api/auth/profile'
+                or path == '/api/auth/users'
+                or path.startswith('/api/auth/users/'))
+            # 业务写接口必须已登录；不再仅凭 X-Console-Token 放行。
+            if not auth_open and not auth_session:
+                if not auth_users.session_user(self._bearer()):
+                    return self.reply(401, {'error': '请先登录'})
             try:
                 size = int(self.headers.get('Content-Length', 0))
-                if not 0 < size <= 262144 or self.headers.get_content_type() != 'application/json':
+                # 头像 data URL 略大于常规 JSON，单独放宽。
+                size_limit = 400000 if path == '/api/auth/profile' else 262144
+                if not 0 < size <= size_limit or self.headers.get_content_type() != 'application/json':
                     raise ValueError('请求格式错误')
                 data = json.loads(self.rfile.read(size))
                 if not isinstance(data, dict):
                     raise ValueError('请求格式错误')
+                if path in ('/api/auth/login', '/login'):
+                    try:
+                        with controller.lock:
+                            return self.reply(200, controller.auth_login(data))
+                    except ValueError as exc:
+                        return self.reply(200, {'success': False, 'message': str(exc)})
+                if path in ('/api/auth/refresh', '/refresh-token'):
+                    try:
+                        return self.reply(200, controller.auth_refresh(data))
+                    except ValueError as exc:
+                        return self.reply(200, {'success': False, 'message': str(exc)})
+                if path == '/api/auth/change-password':
+                    # 优先会话用户；无会话时允许用 body.username + 旧密码证明身份（首登改密更稳）。
+                    username = auth_users.session_user(self._bearer()) or (
+                        data.get('username') or '').strip()
+                    if not username:
+                        return self.reply(401, {'success': False, 'message': '请先登录'})
+                    try:
+                        with controller.lock:
+                            return self.reply(200, controller.auth_change_password(username, data))
+                    except ValueError as exc:
+                        return self.reply(200, {'success': False, 'message': str(exc)})
+                if path == '/api/auth/profile':
+                    username = auth_users.session_user(self._bearer())
+                    if not username:
+                        return self.reply(401, {'success': False, 'message': '请先登录'})
+                    try:
+                        with controller.lock:
+                            return self.reply(200, controller.auth_update_profile(username, data))
+                    except ValueError as exc:
+                        return self.reply(200, {'success': False, 'message': str(exc)})
+                if path == '/api/auth/users' or path.startswith('/api/auth/users/'):
+                    try:
+                        actor = auth_users.require_admin(
+                            controller.users_path(), self._bearer())
+                    except PermissionError as exc:
+                        return self.reply(403, {'success': False, 'message': str(exc)})
+                    try:
+                        with controller.lock:
+                            if path == '/api/auth/users':
+                                return self.reply(200, controller.auth_create_user(data))
+                            if path.endswith('/reset-password'):
+                                target = path[len('/api/auth/users/'):-len('/reset-password')]
+                                return self.reply(
+                                    200, controller.auth_reset_password(unquote(target), data))
+                            if path.endswith('/delete'):
+                                target = path[len('/api/auth/users/'):-len('/delete')]
+                                return self.reply(
+                                    200,
+                                    controller.auth_delete_user(
+                                        unquote(target), actor=actor))
+                            if path.endswith('/update'):
+                                target = path[len('/api/auth/users/'):-len('/update')]
+                                return self.reply(
+                                    200, controller.auth_update_user(unquote(target), data))
+                            # POST /api/auth/users/{username} → 更新
+                            target = path[len('/api/auth/users/'):]
+                            if target and '/' not in target:
+                                return self.reply(
+                                    200, controller.auth_update_user(unquote(target), data))
+                        raise ValueError('用户管理路径无效')
+                    except ValueError as exc:
+                        return self.reply(200, {'success': False, 'message': str(exc)})
                 if self.path == '/api/cameras/probe':
                     return self.reply(200, controller.probe(data.get('url')))
                 if self.path == '/api/alerts/retry':
                     return self.reply(200, controller.retry_outbox(data.get('cameraId'), data.get('id')))
+                if self.path == '/api/alerts/dispose':
+                    return self.reply(200, controller.dispose_alert(
+                        data.get('id'), data.get('disposition'),
+                        handled_by=data.get('handledBy') or '',
+                        note=data.get('note') or ''))
+                if self.path == '/api/alerts/bulk-dispose':
+                    try:
+                        auth_users.require_admin(
+                            controller.users_path(), self._bearer())
+                    except PermissionError as exc:
+                        return self.reply(403, {'error': str(exc)})
+                    hours = data.get('keepWithinHours', 24)
+                    try:
+                        hours = float(hours)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError('保留窗口无效') from exc
+                    return self.reply(200, controller.bulk_dispose_alerts(
+                        keep_within_hours=hours,
+                        disposition=data.get('disposition') or 'handled',
+                        handled_by=data.get('handledBy') or '系统清理',
+                        note=data.get('note') or '历史未处置积压清理',
+                    ))
+                if self.path == '/api/alerts/backfill-videos':
+                    try:
+                        auth_users.require_admin(
+                            controller.users_path(), self._bearer())
+                    except PermissionError as exc:
+                        return self.reply(403, {'error': str(exc)})
+                    limit = data.get('limit', 0)
+                    try:
+                        limit = int(limit or 0)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError('回填数量上限无效') from exc
+                    return self.reply(200, controller.backfill_alert_videos(limit=limit))
+                if self.path == '/api/contacts':
+                    with controller.lock:
+                        return self.reply(200, controller.put_contacts(data))
                 if self.path == '/api/maintenance/run':
                     return self.reply(200, controller._maintain())
                 if self.path == '/api/cameras/live':
@@ -1364,6 +1651,15 @@ if __name__ == '__main__':
     except (RuntimeError, OSError) as exc:
         parser.exit(1, f'无法启动控制台：{exc}\n')
     server = ThreadingHTTPServer(('127.0.0.1', args.port), make_handler(controller, secrets.token_hex(24)))
+
+    def shutdown(signum, frame):
+        # 由主线程的 serve_forever 返回，确保 finally 里的作业回收一定执行。
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    for name in ('SIGINT', 'SIGTERM', 'SIGHUP'):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), shutdown)
+
     print(f'http://127.0.0.1:{args.port}', flush=True)
     try:
         server.serve_forever()

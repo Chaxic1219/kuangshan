@@ -1,0 +1,52 @@
+/* 告警数据大屏 */
+.dash-shell{display:flex;flex-direction:column;gap:16px;min-height:60vh}
+.dash-toolbar{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;padding:14px 16px;background:#10222b;color:#d7e6ea;border-radius:10px}
+.dash-toolbar .filters{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.dash-toolbar label{display:flex;flex-direction:column;gap:4px;font-size:11px;color:#8aa0aa}
+.dash-toolbar select,.dash-toolbar input{min-width:140px;background:#18323c;border:1px solid #2b4a56;color:#e7f2f5;border-radius:6px;padding:8px 10px}
+.dash-toolbar .meta{display:flex;gap:10px;align-items:center;font-size:12px;color:#9bb0b8}
+.dash-toolbar button{background:#1c3b45;border-color:#2f5561;color:#e7f2f5}
+.dash-toolbar button.primary{background:#c9852c;border-color:#c9852c;color:#1a1206}
+.dash-toolbar button.primary:hover{color:#1a1206;filter:brightness(1.05)}
+.dash-kpis{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px}
+.dash-kpi{background:#12262f;border:1px solid #243f4a;border-radius:10px;padding:16px 18px;color:#e8f3f6;cursor:pointer}
+.dash-kpi span{display:block;font-size:12px;color:#8ea3ab;margin-bottom:8px}
+.dash-kpi strong{font-size:28px;line-height:1.1;color:#f0c36a;font-weight:700}
+.dash-kpi small{display:block;margin-top:8px;color:#7f97a0;font-size:11px}
+.dash-grid{display:grid;grid-template-columns:1.4fr 1fr;gap:12px}
+.dash-grid.secondary{grid-template-columns:1fr 1.2fr}
+.dash-card{background:#12262f;border:1px solid #243f4a;border-radius:10px;padding:16px;color:#dceaee;min-height:260px}
+.dash-card h3{margin:0 0 12px;font-size:15px;color:#e8f3f6;font-weight:600}
+.dash-card .empty-note{color:#8ea3ab;font-size:13px;padding:24px 8px}
+.dash-chart{width:100%;height:220px;display:block}
+.dash-legend{display:flex;flex-direction:column;gap:8px;margin-top:8px;font-size:12px;color:#c5d7dd}
+.dash-legend button{text-align:left;background:transparent;border:0;color:inherit;padding:0;cursor:pointer}
+.dash-legend .bar{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:8px;vertical-align:middle}
+.dash-recent{width:100%;border-collapse:collapse;font-size:12px}
+.dash-recent th,.dash-recent td{padding:8px 6px;border-bottom:1px solid #243f4a;text-align:left;color:#d5e4e9}
+.dash-recent th{color:#8ea3ab;font-weight:500}
+.dash-recent img{width:54px;height:36px;object-fit:cover;border-radius:4px;background:#0b171d}
+.dash-recent button{padding:6px 10px;font-size:12px}
+.dash-status{display:flex;flex-wrap:wrap;gap:8px}
+.dash-status .chip{font-size:12px;padding:6px 10px;border-radius:999px;background:#18323c;border:1px solid #2b4a56;color:#d5e4e9}
+.dash-status .chip.good{color:#6cedc4;border-color:#2d6b5d}
+.dash-status .chip.bad{color:#ffb1a6;border-color:#7a3d35}
+.dash-status .chip.wait{color:#f1d587;border-color:#6d5a2c}
+.dash-foot{display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:center;color:#8ea3ab;font-size:12px}
+.dash-foot .warn,.dash-toolbar .meta .warn{color:#f0c36a}
+#dash-evidence{border:1px solid #2b4a56;border-radius:12px;padding:0;background:#0f1f26;color:#e8f3f6;max-width:min(920px,94vw);width:920px}
+#dash-evidence::backdrop{background:rgba(4,10,14,.72)}
+#dash-evidence .close{background:#18323c;border:1px solid #2b4a56;color:#e7f2f5;border-radius:6px;width:36px;height:36px;cursor:pointer}
+.dash-shell.is-fullscreen{position:fixed;inset:0;z-index:12000;background:#0b151a;padding:18px 22px;overflow:auto;border-radius:0}
+.dash-shell.is-fullscreen .dash-kpis{grid-template-columns:repeat(5,minmax(0,1fr))}
+.dash-shell.is-fullscreen .dash-card{min-height:300px}
+body.dash-fullscreen .sidebar,body.dash-fullscreen .topbar,body.dash-fullscreen .heading,body.dash-fullscreen .stats,body.dash-fullscreen .toolbar{display:none!important}
+body.dash-fullscreen .main{margin:0;padding:0;max-width:none}
+@media(max-width:1200px){
+  .dash-kpis{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .dash-grid,.dash-grid.secondary{grid-template-columns:1fr}
+}
+@media(max-width:720px){
+  .dash-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .dash-kpi strong{font-size:22px}
+}

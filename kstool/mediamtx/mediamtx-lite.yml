@@ -15,8 +15,8 @@
 #   bin\mediamtx.exe mediamtx.yml
 #
 # 生成的 RTSP 地址：
-#   主力：rtsp://127.0.0.1:8554/camera1 ~ camera16（接入监控页/数据库）
-#   备用：rtsp://127.0.0.1:8554/camera17 ~ camera18（临时顶替/扩展用）
+#   主力：rtsp://127.0.0.1:8560/camera1 ~ camera16（接入监控页/数据库）
+#   备用：rtsp://127.0.0.1:8560/camera17 ~ camera18（临时顶替/扩展用）
 #
 # 落地阶段：把某一路的 runOnInit 段替换为真实摄像头静态源即可
 #   cameraX:
@@ -31,11 +31,12 @@ apiAddress: 127.0.0.1:9997
 
 # RTSP 服务（模拟摄像头输出）
 rtsp: yes
-rtspAddress: :8554
+rtspAddress: :8560
 
 # 浏览器预览：WebRTC（前端低延迟播放）+ HLS（备用）
 webrtc: yes
 webrtcAddress: :8889
+webrtcAllowOrigins: ["http://127.0.0.1:8765", "http://localhost:8765", "http://127.0.0.1:8848", "http://localhost:8848"]
 hls: yes
 hlsAddress: :8888
 hlsAllowOrigin: "*"
@@ -50,28 +51,28 @@ paths:
     runOnInit: >-
       "bin/ffmpeg_bin/ffmpeg.exe" -re -stream_loop -1 -i
       "videos/camera1.mp4"
-      -c copy -f rtsp rtsp://localhost:8554/camera1
+      -c copy -f rtsp rtsp://localhost:8560/camera1
     runOnInitRestart: yes
 
   camera2:
     runOnInit: >-
       "bin/ffmpeg_bin/ffmpeg.exe" -re -stream_loop -1 -i
       "videos/camera2.mp4"
-      -c copy -f rtsp rtsp://localhost:8554/camera2
+      -c copy -f rtsp rtsp://localhost:8560/camera2
     runOnInitRestart: yes
 
   camera3:
     runOnInit: >-
       "bin/ffmpeg_bin/ffmpeg.exe" -re -stream_loop -1 -i
       "videos/camera3.mp4"
-      -c copy -f rtsp rtsp://localhost:8554/camera3
+      -c copy -f rtsp rtsp://localhost:8560/camera3
     runOnInitRestart: yes
 
   camera4:
     runOnInit: >-
       "bin/ffmpeg_bin/ffmpeg.exe" -re -stream_loop -1 -i
       "videos/camera4.mp4"
-      -c copy -f rtsp rtsp://localhost:8554/camera4
+      -c copy -f rtsp rtsp://localhost:8560/camera4
     runOnInitRestart: yes
 
   # ========== 采掘 · 掘进工作面（含 1 路风险演示） ==========
@@ -79,7 +80,7 @@ paths:
     runOnInit: >-
       "bin/ffmpeg_bin/ffmpeg.exe" -re -stream_loop -1 -i
       "videos/camera5.mp4"
-      -c copy -f rtsp rtsp://localhost:8554/camera5
+      -c copy -f rtsp rtsp://localhost:8560/camera5
     runOnInitRestart: yes
 
   camera6:
@@ -87,19 +88,19 @@ paths:
     runOnInit: >-
       "bin/ffmpeg_bin/ffmpeg.exe" -re -stream_loop -1 -i
       "videos/camera6.mp4"
-      -c copy -f rtsp rtsp://localhost:8554/camera6
+      -c copy -f rtsp rtsp://localhost:8560/camera6
     runOnInitRestart: yes
 
   camera7:
     runOnInit: >-
       "bin/ffmpeg_bin/ffmpeg.exe" -re -stream_loop -1 -i
       "videos/camera7.mp4"
-      -c copy -f rtsp rtsp://localhost:8554/camera7
+      -c copy -f rtsp rtsp://localhost:8560/camera7
     runOnInitRestart: yes
 
   camera8:
     runOnInit: >-
       "bin/ffmpeg_bin/ffmpeg.exe" -re -stream_loop -1 -i
       "videos/camera8.mp4"
-      -c copy -f rtsp rtsp://localhost:8554/camera8
+      -c copy -f rtsp rtsp://localhost:8560/camera8
     runOnInitRestart: yes

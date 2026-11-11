@@ -101,6 +101,29 @@ def list_camera_devices(with_error=False):
     return (devices, '') if with_error else devices
 
 
+def device_aliases(device_id, device_name=''):
+    """本机设备标识的等价集合，用于复用已有 live path。
+
+    macOS 历史配置可能写成 avf:0 / avfoundation:0 / 0 / 0:none。
+    """
+    aliases = {str(device_id or '').strip(), str(device_name or '').strip()}
+    for token in list(aliases):
+        if not token:
+            continue
+        if token.startswith('avfoundation:'):
+            index = token.split(':', 1)[1]
+            aliases.update({f'avf:{index}', index, f'{index}:none'})
+        elif token.startswith('avf:'):
+            index = token.split(':', 1)[1]
+            aliases.update({f'avfoundation:{index}', index, f'{index}:none'})
+        elif token.endswith(':none') and token[:-5].isdigit():
+            index = token[:-5]
+            aliases.update({index, f'avfoundation:{index}', f'avf:{index}'})
+        elif token.isdigit():
+            aliases.update({f'{token}:none', f'avfoundation:{token}', f'avf:{token}'})
+    return {item for item in aliases if item}
+
+
 def build_push_command(device, path_name, framerate=None, size=None, bitrate='1200k',
                        rtsp_port=8554):
     """生成采集转码推 RTSP 的 ffmpeg 命令（单行，供 runOnInit 使用）。

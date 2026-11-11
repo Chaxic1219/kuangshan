@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -294,7 +295,120 @@ def identity_problem(session):
     return None
 
 
+# ==================== 运行时配置与进程清理 ====================
+
+def render_runtime_config(source, target):
+    """生成 MediaMTX 运行时配置：替换 FFmpeg 路径，并给 avfoundation 补 720p。"""
+    text = Path(source).read_text(encoding='utf-8')
+    replacement = host_binaries.quote_bin(FFMPEG)
+    text = re.sub(r'"?bin/ffmpeg_bin/ffmpeg\.exe"?', replacement, text)
+    if sys.platform == 'darwin':
+        text = re.sub(r'(?m)(-f\s+avfoundation)(?![^\n]*-video_size)',
+                      r'\1 -video_size 1280x720', text)
+    Path(target).write_text(text, encoding='utf-8')
+    return target
+
+
+def _terminate_descendants(pid):
+    """MediaMTX 的 runOnInit 子进程可能在独立进程组，退出时需显式清理。"""
+    if not pid:
+        return
+    try:
+        import psutil
+        parent = psutil.Process(int(pid))
+        children = parent.children(recursive=True)
+    except Exception:
+        return
+    for child in children:
+        try:
+            child.terminate()
+        except Exception:
+            pass
+    try:
+        _, alive = psutil.wait_procs(children, timeout=3)
+    except Exception:
+        alive = []
+    for child in alive:
+        try:
+            child.kill()
+        except Exception:
+            pass
+
+
 # ==================== 管理进程 ====================
+
+def _instance_processes(instance_id):
+    """按实例目录匹配该实例的 MediaMTX（管理进程已死时清理残留）。"""
+    if not instance_id:
+        return []
+    marker = str(RUNTIME / str(instance_id))
+    try:
+        import psutil
+    except ImportError:
+        return []
+    found = []
+    for process in psutil.process_iter(['pid', 'cmdline']):
+        try:
+            cmdline = ' '.join(process.info.get('cmdline') or [])
+        except Exception:
+            continue
+        if marker in cmdline and process.pid != os.getpid():
+            found.append(process)
+    return found
+
+
+def _reap_orphan_publishers(port):
+    """清理父进程已消失、仍在向本项目 RTSP 端口推流的 ffmpeg。"""
+    markers = ('rtsp://127.0.0.1:%d/' % int(port), 'rtsp://localhost:%d/' % int(port))
+    try:
+        import psutil
+    except ImportError:
+        return []
+    killed = []
+    for process in psutil.process_iter(['pid', 'ppid', 'cmdline']):
+        try:
+            cmdline = ' '.join(process.info.get('cmdline') or [])
+            ppid = process.info.get('ppid')
+        except Exception:
+            continue
+        if process.pid == os.getpid() or not any(m in cmdline for m in markers):
+            continue
+        if ppid != 1:
+            continue
+        try:
+            process.terminate()
+            killed.append(process.pid)
+        except Exception:
+            pass
+    return killed
+
+
+def cleanup_stale(session):
+    """管理进程已消失时，回收该实例遗留的 MediaMTX 和 ffmpeg。"""
+    processes = _instance_processes(session.get('instanceId'))
+    for process in processes:
+        _terminate_descendants(process.pid)
+    for process in processes:
+        try:
+            process.terminate()
+        except Exception:
+            pass
+    try:
+        import psutil
+        _, alive = psutil.wait_procs(processes, timeout=5)
+    except Exception:
+        alive = []
+    for process in alive:
+        try:
+            process.kill()
+        except Exception:
+            pass
+    try:
+        _reap_orphan_publishers(rtsp_port(session.get('mode', 'full')))
+    except Exception:
+        pass
+    return len(processes)
+
 
 def run_manager(mode, config_path=None):
     process_scope.ensure_supported()
@@ -312,10 +426,28 @@ def run_manager(mode, config_path=None):
             raise RuntimeError('端口已被其他程序占用：%s；拒绝启动，不会终止其他进程'
                                % '、'.join(conflicts))
         instance_dir.mkdir(parents=True, exist_ok=True)
+        runtime_config = render_runtime_config(config, instance_dir/'mediamtx.yml')
         session = write_session(mode, instance_id)
         scope = process_scope.ProcessScope(
-            [str(MTX), str(config)], instance_dir/'mediamtx.log', cwd=BASE)
+            [str(MTX), str(runtime_config)], instance_dir/'mediamtx.log', cwd=BASE)
         stop_file = instance_dir/'STOP'
+
+        def request_stop(signum, frame):
+            # 终端关闭会发 SIGHUP；写 STOP 让主循环走 finally，整组回收。
+            try:
+                stop_file.touch()
+            except OSError:
+                pass
+
+        for signal_name in ('SIGTERM', 'SIGHUP', 'SIGINT'):
+            signal_value = getattr(signal, signal_name, None)
+            if signal_value is None:
+                continue
+            try:
+                signal.signal(signal_value, request_stop)
+            except (ValueError, OSError):
+                pass
+
         if not wait_until(lambda: port_open(port) or scope.active_process_count() == 0, READY_TIMEOUT):
             raise RuntimeError(f'MediaMTX 未在 {READY_TIMEOUT} 秒内监听端口 {port}')
         if scope.active_process_count() == 0:
@@ -326,6 +458,7 @@ def run_manager(mode, config_path=None):
             raise RuntimeError('MediaMTX 意外退出，请查看实例日志')
     finally:
         if scope is not None:
+            _terminate_descendants(scope.pid)
             scope.terminate()
             scope.wait_for_zero(10)
             scope.close()
@@ -348,7 +481,10 @@ def command_start(mode, config_path=None):
             print(f"已有模拟流实例在运行（模式 {session.get('mode')}，PID {session.get('managerPid')}），"
                   "请先运行停止脚本。")
             return 2
-        # 过期或伪造记录：只清理记录，不触碰任何进程。
+        # 管理进程已消失：先回收遗留的 MediaMTX/ffmpeg，再清记录。
+        cleaned = cleanup_stale(session)
+        if cleaned:
+            print(f'已清理上次异常退出遗留的 {cleaned} 个进程。')
         SESSION.unlink(missing_ok=True)
     try:
         check_assets(mode, config_path)
@@ -404,6 +540,11 @@ def command_stop(force=False, expected_mode=None):
         return 4
     problem = identity_problem(session)
     if problem is not None:
+        cleaned = cleanup_stale(session)
+        if cleaned:
+            SESSION.unlink(missing_ok=True)
+            print(f'管理进程不存在，已清理该实例遗留的 {cleaned} 个进程。')
+            return 0
         print(f'拒绝停止：{problem}。未终止任何进程，请人工检查运行记录。')
         return 4
     pid = int(session['managerPid'])

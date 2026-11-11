@@ -27,7 +27,8 @@ class AvfoundationTests(unittest.TestCase):
                 patch.object(host_camera, 'ffmpeg_bin_for_runoninit', return_value='"bin/darwin/ffmpeg"'):
             command = host_camera.build_push_command('0', 'livecam1', framerate=30)
         self.assertIn('-f avfoundation', command)
-        self.assertIn('-i "0"', command)
+        self.assertIn('-i "0:none"', command)
+        self.assertIn('-video_size 1280x720', command)
         self.assertIn('rtsp://127.0.0.1:8554/livecam1', command)
         self.assertNotIn('.exe', command)
 

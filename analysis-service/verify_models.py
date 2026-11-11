@@ -1,9 +1,11 @@
-"""真实加载已登记的三组权重，核对类别并执行一帧推理。"""
+"""真实加载已登记的 YOLO 权重，核对类别并执行一帧推理。"""
 import hashlib
 import json
 import time
 import av
 from catalog import ROOT, MODEL_CATALOG, EVENTS, MEDIA_ROOT, atomic_json
+
+YOLO_KEYS = tuple(key for key, info in MODEL_CATALOG.items() if info.get('file'))
 
 
 def main():
@@ -15,13 +17,17 @@ def main():
     with av.open(str(video)) as container:
         frame = next(container.decode(video=0)).to_ndarray(format='bgr24')
     report = {}
-    for key in ('general', 'ppe', 'fire'):
+    for key in YOLO_KEYS:
         path = ROOT/'weights'/MODEL_CATALOG[key]['file']
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         assert digest == manifest[key]['sha256'], '权重文件哈希发生变化'
         model = YOLO(str(path), task='detect')
         names = list(model.names.values())
-        required = {name for e in EVENTS.values() if e['model'] == key for name in e['labels']}
+        required = set()
+        for event in EVENTS.values():
+            choices = event.get('modelChoices') or [event['model']]
+            if key in choices or event['model'] == key:
+                required.update(name.lower() for name in event['labels'])
         assert required <= {name.lower() for name in names}, f'{key} 缺少要求的训练类别'
         start = time.monotonic()
         result = model.predict(frame, device='cpu', verbose=False, imgsz=640)[0]

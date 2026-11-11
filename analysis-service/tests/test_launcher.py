@@ -1,4 +1,5 @@
 """后台启动参数与重复启动保护。"""
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +8,7 @@ from unittest.mock import Mock, patch
 import launch_console
 
 
+@unittest.skipUnless(os.name == 'nt', '仅 Windows 无窗口启动')
 class LauncherTests(unittest.TestCase):
     def test_existing_console_does_not_spawn_again(self):
         with patch.object(launch_console, 'is_running', return_value=True), \

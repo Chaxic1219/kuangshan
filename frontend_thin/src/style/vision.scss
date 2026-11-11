@@ -1,0 +1,267 @@
+/* 视觉业务页主题令牌：跟随 Element Plus / Pure Admin 明暗与主题色 */
+:root {
+  --vision-accent: var(--el-color-primary, #0f9f86);
+  --vision-accent-hover: var(--el-color-primary-light-3, #0d8a74);
+  --vision-accent-soft: var(--el-color-primary-light-7, #99f6e4);
+  --vision-surface: var(--el-bg-color);
+  --vision-surface-page: var(--el-bg-color-page);
+  --vision-border: var(--el-border-color-lighter);
+  --vision-border-strong: var(--el-border-color);
+  --vision-text: var(--el-text-color-primary);
+  --vision-text-regular: var(--el-text-color-regular);
+  --vision-text-secondary: var(--el-text-color-secondary);
+  --vision-warning: var(--el-color-warning);
+  --vision-danger: var(--el-color-danger);
+  --vision-chart-line: var(--el-color-warning, #d97706);
+  --vision-chart-bar: var(--el-color-primary, #0d9488);
+  --vision-chart-muted: var(--el-text-color-placeholder, #94a3b8);
+  --vision-chart-axis: var(--el-border-color, #e2e8f0);
+  /* 视频画布保持深色底，避免画面发灰 */
+  --vision-media-bg: #070f14;
+  --vision-media-fg: #a3b6c5;
+}
+
+html:not(.dark) {
+  --el-bg-color-page: #f7f9fb;
+}
+
+html.dark {
+  --el-bg-color: #14242c;
+  --el-bg-color-page: #0c181f;
+  --el-bg-color-overlay: #1b2d36;
+  --el-border-color: #2b414c;
+  --el-border-color-light: #263b45;
+  --el-border-color-lighter: #233741;
+  --el-text-color-primary: #e4eef0;
+  --el-text-color-regular: #b7cbd1;
+  --el-text-color-secondary: #87a4af;
+  --vision-media-bg: #0a1218;
+}
+
+body {
+  font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  background: var(--el-bg-color-page);
+}
+
+.vision-page {
+  min-width: 0;
+  color: var(--vision-text);
+}
+.vision-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  margin-bottom: 24px;
+}
+.vision-heading h1 {
+  font-size: 27px;
+  font-weight: 650;
+  letter-spacing: 1px;
+  margin: 0 0 8px;
+  color: var(--vision-text);
+}
+.vision-heading p,
+.vision-muted {
+  color: var(--vision-text-secondary);
+  font-size: 13px;
+  line-height: 1.8;
+}
+.vision-kicker {
+  display: block;
+  color: var(--vision-accent);
+  font-size: 11px;
+  letter-spacing: 2px;
+  margin-bottom: 10px;
+}
+.vision-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+  margin-bottom: 24px;
+}
+.vision-summary article {
+  background: var(--vision-surface);
+  border: 1px solid var(--vision-border);
+  padding: 20px 24px;
+  border-radius: 8px;
+}
+.vision-summary span {
+  display: block;
+  color: var(--vision-text-secondary);
+  font-size: 12px;
+}
+.vision-summary strong {
+  display: block;
+  font-size: 30px;
+  margin-top: 10px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--vision-text);
+}
+.vision-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+.vision-toolbar .el-input {
+  max-width: 300px;
+}
+.vision-camera-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 20px;
+}
+.vision-card {
+  background: var(--vision-surface);
+  border: 1px solid var(--vision-border);
+  border-radius: 9px;
+  overflow: hidden;
+}
+.vision-card-body {
+  padding: 20px;
+}
+.vision-card h2 {
+  font-size: 17px;
+  margin: 0 0 8px;
+  color: var(--vision-text);
+}
+.vision-card .tags {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 15px 0;
+}
+.vision-card-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 18px;
+}
+.vision-card-picture {
+  position: relative;
+  aspect-ratio: 16 / 10;
+  background: var(--vision-media-bg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  cursor: pointer;
+}
+.vision-card-picture > * {
+  max-height: 100%;
+  max-width: 100%;
+}
+.vision-card-status {
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  z-index: 2;
+}
+.camera-cover {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.camera-cover-empty {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  color: var(--vision-media-fg);
+  font-size: 14px;
+}
+.vision-panel {
+  padding: 22px;
+  background: var(--vision-surface);
+  border: 1px solid var(--vision-border);
+  border-radius: 9px;
+}
+.vision-panel h2 {
+  font-size: 17px;
+  margin-bottom: 16px;
+  color: var(--vision-text);
+}
+.vision-error {
+  margin-bottom: 18px;
+}
+.vision-monitor-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+}
+.vision-monitor-grid .vision-card-picture {
+  aspect-ratio: auto;
+  height: auto;
+  min-height: 0;
+  cursor: default;
+  background: var(--vision-media-bg);
+}
+.vision-monitor-grid .vision-card-picture > * {
+  max-width: 100%;
+  max-height: none;
+  width: 100%;
+  height: auto;
+}
+.vision-monitor-grid.single {
+  grid-template-columns: minmax(0, 1fr);
+}
+.vision-monitor-grid.single .vision-card-picture {
+  display: block;
+}
+.vision-viewer .el-dialog__body {
+  background: var(--vision-media-bg);
+}
+.vision-viewer .frame-wrap {
+  max-height: 75vh;
+  margin: auto;
+}
+.el-button,
+.el-input__wrapper,
+.el-select__wrapper {
+  border-radius: 6px;
+}
+.el-dialog {
+  max-width: calc(100vw - 24px);
+}
+
+/* 通用业务卡片 / 导出按钮：供告警大屏、事件记录复用 */
+.vision-export {
+  display: inline-flex;
+  align-items: center;
+  height: 32px;
+  padding: 0 14px;
+  border-radius: 6px;
+  background: var(--vision-accent);
+  color: var(--el-color-white, #fff);
+  font-size: 14px;
+  text-decoration: none;
+}
+.vision-export:hover {
+  background: var(--vision-accent-hover);
+  color: var(--el-color-white, #fff);
+}
+.vision-surface-block {
+  background: var(--vision-surface);
+  border: 1px solid var(--vision-border);
+  border-radius: 10px;
+}
+
+@media (max-width: 900px) {
+  .vision-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .vision-monitor-grid {
+    grid-template-columns: 1fr;
+  }
+  .vision-heading {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .vision-camera-grid {
+    grid-template-columns: 1fr;
+  }
+}

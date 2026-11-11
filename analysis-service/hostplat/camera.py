@@ -86,6 +86,8 @@ def _parse_avfoundation(text: str) -> list[dict]:
         if not match:
             continue
         index, name = match.group(1), match.group(2).strip()
+        if name.lower().startswith('capture screen'):
+            continue  # 屏幕录制设备不是摄像头
         devices.append({
             'id': f'avfoundation:{index}',
             'name': name,
@@ -111,6 +113,13 @@ def ffmpeg_bin_for_runoninit() -> str:
 def build_push_command(device: str, path_name: str, framerate=None, size=None,
                        bitrate: str = '1200k', rtsp_port: int = 8554) -> str:
     backend = capture_backend()
+    if backend == 'avfoundation':
+        # AVFoundation 默认 29.97fps、原生可能选到竖屏 1080x1920；
+        # 统一 720p30，兼顾方向正确与 CPU 占用。
+        if framerate is None:
+            framerate = 30
+        if size is None:
+            size = '1280x720'
     size_arg = f'-video_size {size} ' if size else ''
     rate_arg = f'-framerate {int(framerate)} ' if framerate is not None else ''
     ff = ffmpeg_bin_for_runoninit()
@@ -123,10 +132,13 @@ def build_push_command(device: str, path_name: str, framerate=None, size=None,
             f'{ff} -f dshow {rate_arg}'
             f'-rtbufsize 100M {size_arg}-i video="{device.strip()}" {encode}')
     if backend == 'avfoundation':
-        # device 为索引（推荐）或设备名；索引来自 list 的 index 字段
+        # 索引时显式关闭音频，避免默认抓取不存在的音频设备导致打开失败
+        spec = device.strip()
+        if re.fullmatch(r'\d+', spec):
+            spec = f'{spec}:none'
         return (
             f'{ff} -f avfoundation {rate_arg}{size_arg}'
-            f'-i "{device.strip()}" {encode}')
+            f'-i "{spec}" {encode}')
     # v4l2
     return (
         f'{ff} -f v4l2 {rate_arg}{size_arg}-i {device.strip()} {encode}')

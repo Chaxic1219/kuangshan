@@ -16,6 +16,7 @@ import uuid
 
 import av
 import cv2
+import numpy as np
 from stream_infer.dispatcher import Dispatcher
 from stream_infer.inference import Inference
 from stream_infer.model import Mode
@@ -25,7 +26,9 @@ from catalog import EVENTS, validate_camera, number, atomic_json, resolve_source
 from detectors import ModelPool, SceneAlgo
 from regions import EntryState, contains
 from alerts import AlertReporter
+from evidence_clip import collect_recent_frames, write_evidence_clip
 from maintenance import LOG_MAX_BYTES, LOG_ROTATIONS, LOW_SPACE_BLOCK
+from overlay_style import draw_caption, format_detection_caption, stroke_bgr
 
 
 def now():
@@ -38,6 +41,35 @@ def write_atomic(path, data):
     temp = path.with_name(path.name + '.tmp')
     temp.write_bytes(data)
     replace_atomic(temp, path)
+
+
+def annotate_frame(frame, detections=(), zones=()):
+    """在帧副本上绘制区域与检测框，供实时预览；不改动原帧。"""
+    canvas = frame.copy()
+    height, width = canvas.shape[:2]
+
+    def px(x, y):
+        return int(round(float(x) * (width - 1))), int(round(float(y) * (height - 1)))
+
+    for zone in zones or ():
+        points = zone.get('points') or []
+        if len(points) < 3:
+            continue
+        pts = np.array([px(p[0], p[1]) for p in points], dtype=np.int32)
+        cv2.polylines(canvas, [pts], True, (60, 200, 220), 2, cv2.LINE_AA)
+    for item in detections or ():
+        box = item.get('bbox')
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        x1, y1 = px(box[0], box[1])
+        x2, y2 = px(box[2], box[3])
+        color = stroke_bgr(item if isinstance(item, dict) else {})
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+        text = format_detection_caption(item if isinstance(item, dict) else {})
+        if text:
+            draw_caption(canvas, text, (x1, max(14, y1 - 6)), color,
+                         font_size=max(14, height // 28))
+    return canvas
 
 
 def validate_config(data):
@@ -96,6 +128,8 @@ class Engine(Dispatcher):
         self.fatal = None
         self._sha_seq = -1
         self._frame_sha = ''
+        self._overlay_seq = -1
+        self._overlay = None
         self.latest = {}
         self.entries = {}
         self.last_alert = {}
@@ -170,13 +204,12 @@ class Engine(Dispatcher):
         relative = Path(self.camera['id']) / 'frames' / f'{seq}.jpg'
         try:
             path = self.output / relative
-            # 持续检测时用 JPEG；实时预览固定写 live.jpg。
+            # 证据帧保持无框；实时预览 live.jpg 叠绘本帧全部任务的检测框。
             live = self.directory / 'live.jpg'
             ok, jpeg = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
             if not ok:
                 raise OSError('截图编码失败')
             encoded = jpeg.tobytes()
-            write_atomic(live, encoded)
             if not path.exists():
                 write_atomic(path, encoded)
             # frameSha256 必须能由落盘的证据图复现：JPEG 有损，若对编码前的原始帧
@@ -187,6 +220,15 @@ class Engine(Dispatcher):
                 if stored is None:
                     raise OSError('截图解码校验失败')
                 self._sha_seq, self._frame_sha = seq, hashlib.sha256(stored.tobytes()).hexdigest()
+            if self._overlay_seq != seq or self._overlay is None:
+                self._overlay = frame.copy()
+                self._overlay_seq = seq
+            self._overlay = annotate_frame(self._overlay, shown, zones)
+            ok_live, live_jpeg = cv2.imencode(
+                '.jpg', self._overlay, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+            if not ok_live:
+                raise OSError('预览编码失败')
+            write_atomic(live, live_jpeg.tobytes())
             record = {
                 'schemaVersion': 2, 'taskId': algo_name, 'cameraId': self.camera['id'],
                 'cameraName': self.camera['name'], 'eventId': task['eventId'],
@@ -208,6 +250,15 @@ class Engine(Dispatcher):
                     evidence_path = evidence_dir / (evidence['id']+'.jpg')
                     evidence_path.write_bytes(path.read_bytes())
                     evidence['image'] = '/evidence/' + evidence_path.name
+                    # 视频线索：告警前近几秒帧合成短 MP4；失败不阻断告警落盘。
+                    try:
+                        video_path = evidence_dir / (evidence['id'] + '.mp4')
+                        clip_frames = collect_recent_frames(
+                            self.directory / 'frames', seq)
+                        if write_evidence_clip(clip_frames, video_path):
+                            evidence['video'] = '/evidence/' + video_path.name
+                    except (OSError, ValueError, TypeError, cv2.error):
+                        pass
                     with closing(sqlite3.connect(self.database, timeout=10)) as db, db:
                         db.execute('INSERT INTO alerts VALUES (?,?,?,?)',
                                    (evidence['id'], self.camera['id'], captured, json.dumps(evidence, ensure_ascii=False)))

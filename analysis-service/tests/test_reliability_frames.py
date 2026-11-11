@@ -68,6 +68,7 @@ class FrameConsistencyTests(unittest.TestCase):
                 self.assertIn('/media/cam1/run1/cam1/frames/7.jpg', image)
                 self.assertNotIn('live.jpg', image, '分析画面不能再用 live.jpg 覆盖')
                 self.assertIn('live.jpg', camera['liveImage'], 'liveImage 作为兼容字段保留')
+                self.assertEqual(camera['liveStream'], '/live/cam1')
             finally:
                 controller.close()
 

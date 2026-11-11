@@ -15,9 +15,22 @@ ROOT = Path(__file__).resolve().parent
 # 可用 KUANGSHAN_MEDIA_ROOT 指向其他位置。
 MEDIA_ROOT = Path(os.environ.get('KUANGSHAN_MEDIA_ROOT') or (ROOT.parent / 'kstool'))
 VIDEO_SUFFIXES = ('.mp4', '.avi', '.mkv', '.mov', '.ts')
+# 人员/区域入侵可选权重：开源轻量 ↔ 现场专项重模型。
+PERSON_MODEL_CHOICES = ('person_yolov8n', 'person_yolov8s', 'factory_person')
+
 MODEL_CATALOG = {
     'general': {'name': '通用目标检测', 'file': 'general.pt', 'architecture': 'YOLOv8n',
-                'description': '人员、汽车、卡车、公交车、摩托车、自行车'},
+                'description': '汽车、卡车、公交车、摩托车、自行车等（车辆场景）'},
+    'person_yolov8n': {
+        'name': '开源人员 · YOLOv8n', 'file': 'yolov8n.pt', 'architecture': 'YOLOv8n',
+        'description': 'Ultralytics COCO 预训练（GitHub 官方发布），约 6MB，实时优先',
+    },
+    'person_yolov8s': {
+        'name': '开源人员 · YOLOv8s', 'file': 'yolov8s.pt', 'architecture': 'YOLOv8s',
+        'description': 'Ultralytics COCO 预训练（GitHub 官方发布），约 22MB，精度与速度平衡',
+    },
+    'factory_person': {'name': '工厂人员专项 · 重模型', 'file': 'factory_person.pt', 'architecture': 'YOLO',
+                       'description': '现场工厂人员专项权重，约 113MB，精度优先但 CPU 更重'},
     'ppe': {'name': '安全装备检测', 'file': 'ppe.pt', 'architecture': 'YOLO11n',
             'description': '安全帽、反光衣及未佩戴类别'},
     'fire': {'name': '火焰与烟雾检测', 'file': 'fire.pt', 'architecture': 'YOLOv8n',
@@ -26,9 +39,17 @@ MODEL_CATALOG = {
                'description': '灰度均值判断过暗或过亮'},
 }
 EVENTS = {
-    'person': {'name': '人员检测', 'model': 'general', 'labels': ['person'], 'alarm': False},
+    'person': {
+        'name': '人员检测', 'model': 'person_yolov8n',
+        'modelChoices': list(PERSON_MODEL_CHOICES),
+        'labels': ['person'], 'alarm': False,
+    },
     'vehicle': {'name': '车辆检测', 'model': 'general', 'labels': ['car', 'truck', 'bus', 'motorcycle', 'bicycle'], 'alarm': False},
-    'intrusion': {'name': '人员区域入侵', 'model': 'general', 'labels': ['person'], 'alarm': True, 'region': True},
+    'intrusion': {
+        'name': '人员区域入侵', 'model': 'person_yolov8n',
+        'modelChoices': list(PERSON_MODEL_CHOICES),
+        'labels': ['person'], 'alarm': True, 'region': True,
+    },
     'vehicle_intrusion': {'name': '车辆区域入侵', 'model': 'general', 'labels': ['car', 'truck', 'bus', 'motorcycle', 'bicycle'], 'alarm': True, 'region': True},
     # display：画面上跟随绘制的类别；labels：触发报警的类别。不把人员画进装备检查场景。
     'no_helmet': {'name': '未戴安全帽', 'model': 'ppe', 'labels': ['no-hardhat'],
@@ -129,7 +150,22 @@ def validate_camera(data):
         if EVENTS[eid].get('region') and task['enabled'] and not any(
                 z['id'] in selected and z.get('enabled', True) for z in zones):
             raise ValueError('区域入侵任务至少需要一个已启用的布控区域')
-        task['model'] = EVENTS[eid]['model']
+        default_model = EVENTS[eid]['model']
+        choices = EVENTS[eid].get('modelChoices')
+        if choices:
+            if not isinstance(choices, (list, tuple)) or not choices:
+                raise ValueError('场景模型可选列表无效')
+            selected = task.get('model') or default_model
+            # 旧配置曾把人员任务写成 general，自动迁到默认开源轻量模型。
+            if selected == 'general' and 'person_yolov8n' in choices:
+                selected = 'person_yolov8n'
+            if selected not in choices:
+                raise ValueError(f'{EVENTS[eid]["name"]}的检测模型不在可选范围')
+            if selected not in MODEL_CATALOG:
+                raise ValueError('检测模型未知')
+            task['model'] = selected
+        else:
+            task['model'] = default_model
         task['id'] = eid
     result['tasks'], result['regions'] = tasks, zones
     return result

@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import camera_source
+from hostplat import camera as host_camera
 import console
 from catalog import Store
 
@@ -21,6 +22,7 @@ class LiveSelectionTests(unittest.TestCase):
         self.c = console.Controller(self.work)
         self.addCleanup(self.c.close)
         for item in (
+            patch.object(host_camera, "capture_backend", return_value="dshow"),
             patch.object(camera_source, 'LIVE_CONFIG', self.config),
             patch.object(camera_source, 'list_camera_devices', side_effect=lambda **kw: (self.devices, '')),
             patch.object(camera_source, 'wait_live_ready', return_value=True, create=True),

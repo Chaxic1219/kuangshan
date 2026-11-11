@@ -11,6 +11,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 from console import Controller, make_handler
+from auth_http import admin_bearer
 
 TOKEN = 'outbox-token'
 
@@ -49,6 +50,7 @@ class OutboxApiTests(unittest.TestCase):
             'id': 'cam1', 'name': '测试视频', 'url': 'rtsp://localhost/a',
             'tasks': [], 'regions': [], 'cover': '/covers/x.jpg'})
         seed_outbox(self.work, 'cam1', dead=3, pending=1)
+        self.bearer = admin_bearer(self.controller)
         self.server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(self.controller, TOKEN))
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -60,16 +62,19 @@ class OutboxApiTests(unittest.TestCase):
         self.controller.close()
         self.tmp.cleanup()
 
-    def request(self, method, path, body=None, token=TOKEN, host=None):
+    def request(self, method, path, body=None, bearer=None, host=None):
+        if bearer is None and body is not None:
+            bearer = self.bearer
         conn = HTTPConnection('127.0.0.1', self.server.server_port, timeout=20)
         headers = {'Host': host or '127.0.0.1:%d' % self.server.server_port}
+        payload = None
         if body is not None:
             payload = json.dumps(body).encode()
             headers['Content-Type'] = 'application/json'
             headers['Content-Length'] = str(len(payload))
-        if token:
-            headers['X-Console-Token'] = token
-        conn.request(method, path, body=payload if body is not None else None, headers=headers)
+        if bearer:
+            headers['Authorization'] = f'Bearer {bearer}'
+        conn.request(method, path, body=payload, headers=headers)
         response = conn.getresponse()
         data = json.loads(response.read().decode('utf-8'))
         conn.close()
@@ -133,10 +138,10 @@ class OutboxApiTests(unittest.TestCase):
         status, data = self.request('POST', '/api/alerts/retry', {'cameraId': 'cam1', 'id': '../x'})
         self.assertEqual(status, 400)
 
-    def test_retry_requires_token(self):
+    def test_retry_requires_login(self):
         status, _ = self.request('POST', '/api/alerts/retry',
-                                 {'cameraId': 'cam1', 'id': 'dead-0'}, token='')
-        self.assertEqual(status, 403)
+                                 {'cameraId': 'cam1', 'id': 'dead-0'}, bearer='')
+        self.assertEqual(status, 401)
 
 
 if __name__ == '__main__':

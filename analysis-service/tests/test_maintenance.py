@@ -29,6 +29,15 @@ def old(path, seconds):
     os.utime(path, (stamp, stamp))
 
 
+def pathset(items):
+    """统一 resolve，避免 macOS /var → /private/var 断言失败。"""
+    return {str(Path(item['path']).resolve()) for item in items}
+
+
+def rpath(path):
+    return str(Path(path).resolve())
+
+
 def write_run(root, camera='A', uuid=UUID_A, run_id='r1', latest=None, at_seconds=0):
     run_dir = root/'runtime'/camera/uuid/run_id
     camera_dir = run_dir/camera
@@ -76,13 +85,13 @@ class MaintenanceTests(unittest.TestCase):
         old(new_frame, 10)
         # 活动运行目录本身受保护，不影响普通帧清理候选
         report = self.maintenance.plan()
-        paths = {item['path'] for item in report['candidates']}
-        self.assertIn(str(old_frame), paths)
-        self.assertNotIn(str(latest_frame), paths)
-        self.assertNotIn(str(new_frame), paths)
+        paths = pathset(report['candidates'])
+        self.assertIn(rpath(old_frame), paths)
+        self.assertNotIn(rpath(latest_frame), paths)
+        self.assertNotIn(rpath(new_frame), paths)
 
         executed = self.maintenance.execute()
-        self.assertTrue(any(item['path'] == str(old_frame) for item in executed['deleted']))
+        self.assertTrue(any(rpath(item['path']) == rpath(old_frame) for item in executed['deleted']))
         self.assertTrue(latest_frame.exists())
         self.assertTrue(new_frame.exists())
         self.assertFalse(old_frame.exists())
@@ -104,10 +113,10 @@ class MaintenanceTests(unittest.TestCase):
         old(stale, 2 * DAY)
         old(fresh, 60)
         report = self.maintenance.plan()
-        paths = {item['path'] for item in report['candidates']}
-        self.assertIn(str(stale), paths)
-        self.assertNotIn(str(referenced), paths)
-        self.assertNotIn(str(fresh), paths)
+        paths = pathset(report['candidates'])
+        self.assertIn(rpath(stale), paths)
+        self.assertNotIn(rpath(referenced), paths)
+        self.assertNotIn(rpath(fresh), paths)
         self.maintenance.execute()
         self.assertTrue(referenced.exists())
         self.assertFalse(stale.exists())
@@ -128,13 +137,13 @@ class MaintenanceTests(unittest.TestCase):
         old(bad, 8 * DAY)
 
         report = self.maintenance.plan()
-        paths = {item['path'] for item in report['candidates']}
-        self.assertIn(str(old_run.parent), paths)
-        self.assertNotIn(str(active_run.parent), paths)
-        self.assertNotIn(str(db_run.parent), paths)
-        unknown_paths = {item['path'] for item in report['unknown']}
-        self.assertIn(str(db_run.parent), unknown_paths)
-        self.assertIn(str(bad), unknown_paths)
+        paths = pathset(report['candidates'])
+        self.assertIn(rpath(old_run.parent), paths)
+        self.assertNotIn(rpath(active_run.parent), paths)
+        self.assertNotIn(rpath(db_run.parent), paths)
+        unknown_paths = pathset(report['unknown'])
+        self.assertIn(rpath(db_run.parent), unknown_paths)
+        self.assertIn(rpath(bad), unknown_paths)
 
         self.maintenance.execute()
         self.assertFalse(old_run.parent.exists())
@@ -156,9 +165,9 @@ class MaintenanceTests(unittest.TestCase):
         old(pending, 8 * DAY)
 
         report = self.maintenance.plan()
-        paths = {item['path'] for item in report['candidates']}
-        self.assertIn(str(smoke), paths)
-        self.assertNotIn(str(pending), paths)
+        paths = pathset(report['candidates'])
+        self.assertIn(rpath(smoke), paths)
+        self.assertNotIn(rpath(pending), paths)
         self.maintenance.execute()
         self.assertFalse(smoke.exists())
         self.assertTrue(pending.exists())
@@ -182,17 +191,17 @@ class MaintenanceTests(unittest.TestCase):
             conn.execute('CREATE TABLE outbox (id TEXT, state TEXT, snapshot TEXT)')
             conn.execute('INSERT INTO outbox VALUES (?,?,?)', ('x', 'pending', str(referenced)))
         report = self.maintenance.plan()
-        paths = {item['path'] for item in report['candidates']}
-        self.assertIn(str(free_file), paths)
-        self.assertNotIn(str(referenced), paths)
-        self.assertNotIn(str(fresh), paths)
+        paths = pathset(report['candidates'])
+        self.assertIn(rpath(free_file), paths)
+        self.assertNotIn(rpath(referenced), paths)
+        self.assertNotIn(rpath(fresh), paths)
         # 清理期间入队：执行前新增对 free.jpg 的引用，执行必须重新检查并保留。
         with closing(sqlite3.connect(db)) as conn, conn:
             conn.execute('INSERT INTO outbox VALUES (?,?,?)', ('y', 'dead', str(free_file)))
         result = self.maintenance.execute()
         self.assertTrue(free_file.exists(), '清理期间新增引用后不得删除文件')
-        statuses = {item['path']: item for item in result['deleted']}
-        self.assertNotIn(str(free_file), statuses)
+        statuses = {rpath(item['path']): item for item in result['deleted']}
+        self.assertNotIn(rpath(free_file), statuses)
 
     def test_outbox_reference_error_stops_batch(self):
         camera_dir = self.work/'outbox'/'A'
@@ -224,9 +233,9 @@ class MaintenanceTests(unittest.TestCase):
         try:
             old(link, 8 * DAY)
             report = self.maintenance.plan()
-            unknown = {item['path'] for item in report['unknown']}
-            self.assertIn(str(link), unknown)
-            self.assertNotIn(str(link), {item['path'] for item in report['candidates']})
+            unknown = pathset(report['unknown'])
+            self.assertIn(rpath(link), unknown)
+            self.assertNotIn(rpath(link), pathset(report['candidates']))
             self.maintenance.execute()
             self.assertTrue((outside/'keep.txt').exists(), '不得删除 junction 指向的外部文件')
         finally:
@@ -296,7 +305,7 @@ class MaintenanceTests(unittest.TestCase):
         report = self.maintenance.plan()
         self.assertTrue(report['preview'])
         self.assertTrue(cover.exists(), '预览模式不得改动文件')
-        self.assertTrue(any(item['path'] == str(cover) for item in report['candidates']))
+        self.assertIn(rpath(cover), pathset(report['candidates']))
 
     def test_busy_file_is_skipped(self):
         run_dir, _ = write_run(self.work, latest={})
@@ -304,13 +313,11 @@ class MaintenanceTests(unittest.TestCase):
         file = frames/'9.jpg'
         file.write_bytes(b'x')
         old(file, 600)
-        handle = open(file, 'rb')
-        try:
+        # macOS 上仅 open() 不阻止 unlink，改为注入占用错误以保证跨平台。
+        with patch.object(Path, 'unlink', side_effect=OSError('busy')):
             result = self.maintenance.execute()
-            self.assertTrue(any(item['path'] == str(file) for item in result['skipped']))
+            self.assertIn(rpath(file), pathset(result['skipped']))
             self.assertTrue(file.exists())
-        finally:
-            handle.close()
         self.maintenance.execute()
         self.assertFalse(file.exists())
 

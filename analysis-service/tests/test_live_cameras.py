@@ -9,8 +9,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 import camera_source
+from hostplat import camera as host_camera
 import console
 from console import Controller, make_handler
+from auth_http import admin_bearer
 
 TOKEN = 'live-token'
 
@@ -20,6 +22,7 @@ class LiveCameraApiTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.work = Path(self.tmp.name)
         self.patches = [
+            patch.object(host_camera, "capture_backend", return_value="dshow"),
             patch.object(camera_source, 'LIVE_CONFIG', self.work/'mediamtx-live.yml'),
             patch.object(console, 'STREAM_SESSION', self.work/'session.json'),
             patch.object(camera_source, 'list_camera_devices',
@@ -33,6 +36,7 @@ class LiveCameraApiTests(unittest.TestCase):
         for item in self.patches:
             item.start()
         self.controller = Controller(self.work)
+        self.bearer = admin_bearer(self.controller)
         self.server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(self.controller, TOKEN))
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -46,7 +50,9 @@ class LiveCameraApiTests(unittest.TestCase):
             item.stop()
         self.tmp.cleanup()
 
-    def request(self, method, path, body=None, token=TOKEN):
+    def request(self, method, path, body=None, bearer=None):
+        if bearer is None and body is not None:
+            bearer = self.bearer
         conn = HTTPConnection('127.0.0.1', self.server.server_port, timeout=20)
         headers = {'Host': '127.0.0.1:%d' % self.server.server_port}
         payload = None
@@ -54,8 +60,8 @@ class LiveCameraApiTests(unittest.TestCase):
             payload = json.dumps(body).encode()
             headers['Content-Type'] = 'application/json'
             headers['Content-Length'] = str(len(payload))
-        if token:
-            headers['X-Console-Token'] = token
+        if bearer:
+            headers['Authorization'] = f'Bearer {bearer}'
         conn.request(method, path, body=payload, headers=headers)
         response = conn.getresponse()
         data = json.loads(response.read().decode('utf-8'))
@@ -80,7 +86,7 @@ class LiveCameraApiTests(unittest.TestCase):
             status, data = self.request('POST', '/api/cameras/live/prepare',
                                         {'deviceId': 'USB Camera A'})
         self.assertEqual(status, 200)
-        self.assertEqual(data['url'], 'rtsp://127.0.0.1:8554/livecam1')
+        self.assertEqual(data['url'], 'rtsp://127.0.0.1:8560/livecam1')
         self.assertEqual(data['coverToken'], 'preview')
         probe.assert_called_once_with(data['url'])
         start.assert_called_once_with('start')
@@ -139,7 +145,7 @@ class LiveCameraApiTests(unittest.TestCase):
         status, data = self.request('POST', '/api/cameras/live', {'device': 'USB Camera A'})
         self.assertEqual(status, 200)
         self.assertEqual(data['path'], 'livecam1')
-        self.assertEqual(data['url'], 'rtsp://127.0.0.1:8554/livecam1')
+        self.assertEqual(data['url'], 'rtsp://127.0.0.1:8560/livecam1')
         self.assertTrue(data['added'])
         config = self.work/'mediamtx-live.yml'
         self.assertTrue(config.is_file())
@@ -192,13 +198,13 @@ class LiveCameraApiTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn('端口', data['error'])
 
-    def test_requires_token(self):
+    def test_requires_login(self):
         status, _ = self.request('POST', '/api/cameras/live',
-                                 {'device': 'USB Camera A'}, token='')
-        self.assertEqual(status, 403)
+                                 {'device': 'USB Camera A'}, bearer='')
+        self.assertEqual(status, 401)
         status, _ = self.request('POST', '/api/cameras/live/batch',
-                                 {'selections': [], 'start': False}, token='')
-        self.assertEqual(status, 403)
+                                 {'selections': [], 'start': False}, bearer='')
+        self.assertEqual(status, 401)
 
     def test_batch_api_saves_without_opening_device(self):
         status, data = self.request('POST', '/api/cameras/live/batch',

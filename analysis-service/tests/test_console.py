@@ -70,8 +70,8 @@ class ConsoleTests(unittest.TestCase):
                     ('GET','/api/state',{},200),
                     ('GET','/api/state',{'Host':'evil.example'},403),
                     ('GET','/media/../../cameras.json',{},404),
-                    ('POST','/api/cameras/start',{},403),
-                    ('POST','/api/cameras/start',{'Origin':'https://evil.example','X-Console-Token':'test-token'},403)]:
+                    ('POST','/api/cameras/start',{},401),
+                    ('POST','/api/cameras/start',{'Origin':'https://evil.example','Authorization':'Bearer x'},403)]:
                     conn=HTTPConnection('127.0.0.1',server.server_port)
                     conn.request(method,path,headers=headers)
                     response=conn.getresponse();response.read()

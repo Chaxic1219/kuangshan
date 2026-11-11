@@ -1,4 +1,4 @@
-# 矿山视界 · 本地 YOLO 视频分析
+# 视联洞察 · 本地 YOLO 视频分析
 
 本机控制台：配置多路视频、绑定 YOLO/OpenCV 场景、多边形区域入侵报警。画面与推理均在本机完成，不上传云端。
 
@@ -29,7 +29,7 @@
 | 新版控制台 | http://127.0.0.1:8765/ui/ | Pure Admin 精简版完整骨架；登录 `admin` / `admin` |
 | 旧版控制台 | http://127.0.0.1:8765/legacy/ | 原生 HTML 回退入口，配置与分析逻辑相同 |
 
-前端工程目录为 `frontend_thin/`（官方 thin 骨架 + 矿山业务菜单）。构建产物由控制台优先托管 `frontend_thin/dist`。
+前端工程目录为 `frontend_thin/`（官方 thin 骨架 + 视觉业务菜单）。构建产物由控制台优先托管 `frontend_thin/dist`。
 
 ```powershell
 cd frontend_thin
@@ -48,7 +48,7 @@ pnpm build
 | 视频来源 | 预览方式 | 前置条件 |
 |---|---|---|
 | 本地 mp4 | `/preview/` 连续播放 | 无 |
-| 本机 RTSP（`rtsp://127.0.0.1:8554/...`） | MediaMTX WebRTC（8889） | 先启动 `kstool\启动-本机摄像头.bat` 或模拟流 bat |
+| 本机 RTSP（`rtsp://127.0.0.1:8560/...`） | MediaMTX WebRTC（8889） | 先启动 `kstool\启动-本机摄像头.bat` 或模拟流 bat |
 | 其他远程 RTSP | 仍为分析截帧 | 浏览器无法直接播 RTSP |
 
 需要看检测框时，在监控卡片上切换到「检测截帧」。WebRTC 跨域已允许控制台 Origin；改 `mediamtx*.yml` 后需重启推流。
@@ -61,7 +61,8 @@ pnpm build
 
 | 模型 | 权重 | 场景 |
 |---|---|---|
-| 通用目标检测 | `weights/general.pt` | 人员、车辆、人员/车辆区域入侵 |
+| 工厂人员检测 | `weights/factory_person.pt` | 人员检测、人员区域入侵 |
+| 通用目标检测 | `weights/general.pt` | 车辆检测、车辆区域入侵 |
 | 安全装备 | `weights/ppe.pt` | 未戴安全帽、未穿反光衣 |
 | 火焰烟雾 | `weights/fire.pt` | 火焰、烟雾 |
 | OpenCV | 无需权重 | 亮度异常 |
